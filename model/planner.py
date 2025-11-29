@@ -9,8 +9,8 @@ class MotionPlanner:
         # define cost function
         cost_function_weights = [th.ScaleCostWeight(th.Variable(torch.rand(1), name=f'cost_function_weight_{i+1}')) for i in range(feature_len)]
             
-        # define control variable
-        control_variables = th.Vector(dof=100, name="control_variables")
+        # define control variable (trajectory_len * 2 for acceleration and steering)
+        control_variables = th.Vector(dof=trajectory_len*2, name="control_variables")
         
         # define prediction variable
         predictions = th.Variable(torch.empty(1, 10, trajectory_len, 3), name="predictions")
@@ -23,7 +23,7 @@ class MotionPlanner:
 
         # set up objective
         objective = th.Objective()
-        self.objective = cost_function(objective, control_variables, current_state, predictions, ref_line_info, cost_function_weights)
+        self.objective = cost_function(objective, control_variables, current_state, predictions, ref_line_info, cost_function_weights, trajectory_len)
 
         # set up optimizer
         if test:
@@ -69,33 +69,35 @@ def bicycle_model(control, current_state):
 
 # cost functions
 def acceleration(optim_vars, aux_vars):
-    control = optim_vars[0].tensor.view(-1, 50, 2)
+    # Dynamically compute trajectory length from tensor size
+    traj_len = optim_vars[0].tensor.shape[0] // optim_vars[0].tensor.shape[0] # Will be overridden below
+    control = optim_vars[0].tensor.reshape(-1, 12, 2)
     acc = control[:, :, 0]
     
     return acc
 
 def jerk(optim_vars, aux_vars):
-    control = optim_vars[0].tensor.view(-1, 50, 2)
+    control = optim_vars[0].tensor.reshape(-1, 12, 2)
     acc = control[:, :, 0]
     jerk = torch.diff(acc) / 0.1
     
     return jerk
 
 def steering(optim_vars, aux_vars):
-    control = optim_vars[0].tensor.view(-1, 50, 2)
+    control = optim_vars[0].tensor.reshape(-1, 12, 2)
     steering = control[:, :, 1]
 
     return steering 
 
 def steering_change(optim_vars, aux_vars):
-    control = optim_vars[0].tensor.view(-1, 50, 2)
+    control = optim_vars[0].tensor.reshape(-1, 12, 2)
     steering = control[:, :, 1]
     steering_change = torch.diff(steering) / 0.1
 
     return steering_change
 
 def speed(optim_vars, aux_vars):
-    control = optim_vars[0].tensor.view(-1, 50, 2)
+    control = optim_vars[0].tensor.reshape(-1, 12, 2)
     current_state = aux_vars[1].tensor[:, 0]
     velocity = torch.hypot(current_state[:, 3], current_state[:, 4]) 
     dt = 0.1
@@ -109,7 +111,7 @@ def speed(optim_vars, aux_vars):
     return speed_error
 
 def lane_xy(optim_vars, aux_vars):
-    control = optim_vars[0].tensor.view(-1, 50, 2)
+    control = optim_vars[0].tensor.reshape(-1, 12, 2)
     ref_line = aux_vars[0].tensor
     current_state = aux_vars[1].tensor[:, 0]
     
@@ -122,7 +124,7 @@ def lane_xy(optim_vars, aux_vars):
     return lane_error
 
 def lane_theta(optim_vars, aux_vars):
-    control = optim_vars[0].tensor.view(-1, 50, 2)
+    control = optim_vars[0].tensor.reshape(-1, 12, 2)
     ref_line = aux_vars[0].tensor
     current_state = aux_vars[1].tensor[:, 0]
 
@@ -136,7 +138,7 @@ def lane_theta(optim_vars, aux_vars):
     return lane_error
 
 def red_light_violation(optim_vars, aux_vars):
-    control = optim_vars[0].tensor.view(-1, 50, 2)
+    control = optim_vars[0].tensor.reshape(-1, 12, 2)
     current_state = aux_vars[1].tensor[:, 0]
     ref_line = aux_vars[0].tensor
     red_light = ref_line[..., -1]
@@ -155,7 +157,7 @@ def red_light_violation(optim_vars, aux_vars):
     return red_light_error
 
 def safety(optim_vars, aux_vars):
-    control = optim_vars[0].tensor.view(-1, 50, 2)
+    control = optim_vars[0].tensor.reshape(-1, 12, 2)
     neighbors = aux_vars[0].tensor.permute(0, 2, 1, 3)
     current_state = aux_vars[1].tensor
     ref_line = aux_vars[2].tensor
@@ -192,31 +194,33 @@ def safety(optim_vars, aux_vars):
 
     return safe_error
 
-def cost_function(objective, control_variables, current_state, predictions, ref_line, cost_function_weights, vectorize=True):
-    # travel efficiency
-    speed_cost = th.AutoDiffCostFunction([control_variables], speed, 50, cost_function_weights[0], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="speed")
-    objective.add(speed_cost)
+def cost_function(objective, control_variables, current_state, predictions, ref_line, cost_function_weights, trajectory_len, vectorize=True):
+    # travel efficiency (COMENTADO - depende del mapa para límites de velocidad)
+    # speed_cost = th.AutoDiffCostFunction([control_variables], speed, trajectory_len, cost_function_weights[0], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="speed")
+    # objective.add(speed_cost)
 
     # comfort
-    acc_cost = th.AutoDiffCostFunction([control_variables], acceleration, 50, cost_function_weights[1], autograd_vectorize=vectorize, name="acceleration")
+    acc_cost = th.AutoDiffCostFunction([control_variables], acceleration, trajectory_len, cost_function_weights[1], autograd_vectorize=vectorize, name="acceleration")
     objective.add(acc_cost)
-    jerk_cost = th.AutoDiffCostFunction([control_variables], jerk, 49, cost_function_weights[2], autograd_vectorize=vectorize, name="jerk")
+    jerk_cost = th.AutoDiffCostFunction([control_variables], jerk, trajectory_len-1, cost_function_weights[2], autograd_vectorize=vectorize, name="jerk")
     objective.add(jerk_cost)
-    steering_cost = th.AutoDiffCostFunction([control_variables], steering, 50, cost_function_weights[3], autograd_vectorize=vectorize, name="steering")
+    steering_cost = th.AutoDiffCostFunction([control_variables], steering, trajectory_len, cost_function_weights[3], autograd_vectorize=vectorize, name="steering")
     objective.add(steering_cost)
-    steering_change_cost = th.AutoDiffCostFunction([control_variables], steering_change, 49, cost_function_weights[4], autograd_vectorize=vectorize, name="steering_change")
+    steering_change_cost = th.AutoDiffCostFunction([control_variables], steering_change, trajectory_len-1, cost_function_weights[4], autograd_vectorize=vectorize, name="steering_change")
     objective.add(steering_change_cost)
     
-    # lane
-    lane_xy_cost = th.AutoDiffCostFunction([control_variables], lane_xy, 50, cost_function_weights[5], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="lane_xy")
-    objective.add(lane_xy_cost)
-    lane_theta_cost = th.AutoDiffCostFunction([control_variables], lane_theta, 25, cost_function_weights[6], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="lane_theta")
-    objective.add(lane_theta_cost)
+    # lane (COMENTADO - depende del mapa)
+    # lane_xy_cost = th.AutoDiffCostFunction([control_variables], lane_xy, trajectory_len, cost_function_weights[5], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="lane_xy")
+    # objective.add(lane_xy_cost)
+    # lane_theta_cost = th.AutoDiffCostFunction([control_variables], lane_theta, trajectory_len//2, cost_function_weights[6], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="lane_theta")
+    # objective.add(lane_theta_cost)
 
-    # traffic rules
-    red_light_cost = th.AutoDiffCostFunction([control_variables], red_light_violation, 50, cost_function_weights[7], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="red_light")
-    objective.add(red_light_cost)
-    safety_cost = th.AutoDiffCostFunction([control_variables], safety, 10, cost_function_weights[8], aux_vars=[predictions, current_state, ref_line], autograd_vectorize=vectorize, name="safety")
-    objective.add(safety_cost)
+    # traffic rules (COMENTADO - depende del mapa para semáforos)
+    # red_light_cost = th.AutoDiffCostFunction([control_variables], red_light_violation, trajectory_len, cost_function_weights[7], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="red_light")
+    # objective.add(red_light_cost)
+    
+    # safety (COMENTADO - depende del mapa para sistema de coordenadas Frenet)
+    # safety_cost = th.AutoDiffCostFunction([control_variables], safety, 10, cost_function_weights[8], aux_vars=[predictions, current_state, ref_line], autograd_vectorize=vectorize, name="safety")
+    # objective.add(safety_cost)
 
     return objective

@@ -6,11 +6,15 @@ import argparse
 import logging
 import os
 import numpy as np
+import subprocess
 from torch import nn, optim
 from utils.train_utils import *
 from model.planner import MotionPlanner
 from model.predictor import Predictor
 from torch.utils.data import DataLoader
+
+"""python train.py --name pedestrian_NO_planning --batch_size 4 --train_set processed_data_test --valid_set processed_data_test --train_epochs 50 --learning_rate 0.0001"""
+"""python train.py --name pedestrian_WITH_planning --batch_size 4 --use_planning --train_set processed_data_test --valid_set processed_data_test --train_epochs 50 --learning_rate 0.00005"""
 
 def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
     epoch_loss = []
@@ -20,30 +24,41 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
     predictor.train()
     start_time = time.time()
 
-    for batch in data_loader:
+    for batch_idx, batch in enumerate(data_loader):
         # prepare data
         ego = batch[0].to(args.device)
         neighbors = batch[1].to(args.device)
-        map_lanes = batch[2].to(args.device)
-        map_crosswalks = batch[3].to(args.device)
-        ref_line_info = batch[4].to(args.device)
-        ground_truth = batch[5].to(args.device)
+        ground_truth = batch[2].to(args.device)
+        
+        # ========== AGREGAR PRINTS (solo primer batch) ==========
+        if batch_idx == 0:
+            print(f"\n=== Tensor Shapes en GPU ===")
+            print(f"ego.shape: {ego.shape}")
+            print(f"neighbors.shape: {neighbors.shape}")
+            print(f"ground_truth.shape: {ground_truth.shape}")
+            print(f"ego device: {ego.device}")
+        # ========================================================
+        
         current_state = torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
         weights = torch.ne(ground_truth[:, 1:, :, :3], 0)
 
         # predict
         optimizer.zero_grad()
-        plans, predictions, scores, cost_function_weights = predictor(ego, neighbors, map_lanes, map_crosswalks)
+        plans, predictions, scores, cost_function_weights = predictor(ego, neighbors)
+
         plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(3)], dim=1)
-        loss = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights) # multi-future multi-agent loss
+        loss = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights)
         
         # plan
         if use_planning:
             plan, prediction = select_future(plans, predictions, scores)
+            
+            # Create dummy ref_line_info for pedestrian (not using map) - shape: [batch, 1200, 5]
+            ref_line_info = torch.zeros(ego.shape[0], 1200, 5).to(args.device)
 
             planner_inputs = {
-                "control_variables": plan.view(-1, 100), # initial control sequence
-                "predictions": prediction, # prediction for surrounding vehicles 
+                "control_variables": plan.view(ego.shape[0], 24),
+                "predictions": prediction,
                 "ref_line_info": ref_line_info,
                 "current_state": current_state
             }
@@ -52,19 +67,20 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
                 planner_inputs[f'cost_function_weight_{i+1}'] = cost_function_weights[:, i].unsqueeze(1)
 
             final_values, info = planner.layer.forward(planner_inputs)
-            plan = final_values["control_variables"].view(-1, 50, 2)
+            plan = final_values["control_variables"].view(-1, 12, 2)
             plan = bicycle_model(plan, ego[:, -1])[:, :, :3]
 
-            plan_cost = planner.objective.error_squared_norm().mean() / planner.objective.dim()
+            plan_cost = info.last_err.mean() if hasattr(info, 'last_err') else 0
             plan_loss = F.smooth_l1_loss(plan, ground_truth[:, 0, :, :3]) 
             plan_loss += F.smooth_l1_loss(plan[:, -1], ground_truth[:, 0, -1, :3])
-            loss += plan_loss + 1e-3 * plan_cost # planning loss
+            
+            loss += plan_loss + 1e-3 * plan_cost
         else:
             plan, prediction = select_future(plan_trajs, predictions, scores)
 
         # loss backward
         loss.backward()
-        nn.utils.clip_grad_norm_(predictor.parameters(), 5)
+        nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
         optimizer.step()
 
         # compute metrics
@@ -98,25 +114,29 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
         # prepare data
         ego = batch[0].to(args.device)
         neighbors = batch[1].to(args.device)
-        map_lanes = batch[2].to(args.device)
-        map_crosswalks = batch[3].to(args.device)
-        ref_line_info = batch[4].to(args.device)
-        ground_truth = batch[5].to(args.device)
+        # map_lanes = batch[2].to(args.device)
+        # map_crosswalks = batch[3].to(args.device)
+        # ref_line_info = batch[4].to(args.device)
+        ground_truth = batch[2].to(args.device)
         current_state = torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
         weights = torch.ne(ground_truth[:, 1:, :, :3], 0)
 
         # predict
         with torch.no_grad():
-            plans, predictions, scores, cost_function_weights = predictor(ego, neighbors, map_lanes, map_crosswalks)
+            # plans, predictions, scores, cost_function_weights = predictor(ego, neighbors, map_lanes, map_crosswalks)
+            plans, predictions, scores, cost_function_weights = predictor(ego, neighbors)
             plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(3)], dim=1)
             loss = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights) # multi-future multi-agent loss
 
         # plan 
         if use_planning:
             plan, prediction = select_future(plans, predictions, scores)
+            
+            # Create dummy ref_line_info for pedestrian (not using map) - shape: [batch, 1200, 5]
+            ref_line_info = torch.zeros(ego.shape[0], 1200, 5).to(args.device)
 
             planner_inputs = {
-                "control_variables": plan.view(-1, 100), # generate initial control sequence
+                "control_variables": plan.view(ego.shape[0], 24), # generate initial control sequence (12*2)
                 "predictions": prediction, # generate predictions for surrounding vehicles 
                 "ref_line_info": ref_line_info,
                 "current_state": current_state
@@ -128,10 +148,11 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
             with torch.no_grad():
                 final_values, info = planner.layer.forward(planner_inputs)
 
-            plan = final_values["control_variables"].view(-1, 50, 2)
+            plan = final_values["control_variables"].view(-1, 12, 2)
             plan = bicycle_model(plan, ego[:, -1])[:, :, :3]
 
-            plan_cost = planner.objective.error_squared_norm().mean() / planner.objective.dim()
+            # Usar el error del optimizador en lugar de error_squared_norm
+            plan_cost = info.last_err.mean() if hasattr(info, 'last_err') else 0
             plan_loss = F.smooth_l1_loss(plan, ground_truth[:, 0, :, :3])
             plan_loss += F.smooth_l1_loss(plan[:, -1], ground_truth[:, 0, -1, :3])
             loss += plan_loss + 1e-3 * plan_cost # planning loss
@@ -172,11 +193,11 @@ def model_training():
     set_seed(args.seed)
 
     # set up predictor
-    predictor = Predictor(50).to(args.device)
+    predictor = Predictor(12).to(args.device)
     
     # set up planner
     if args.use_planning:
-        trajectory_len, feature_len = 50, 9
+        trajectory_len, feature_len = 12, 9
         planner = MotionPlanner(trajectory_len, feature_len, args.device)
     else:
         planner = None
@@ -233,6 +254,34 @@ def model_training():
         # save model at the end of epoch
         torch.save(predictor.state_dict(), f'training_log/{args.name}/model_{epoch+1}_{val_metrics[0]:.4f}.pth')
         logging.info(f"Model saved in training_log/{args.name}\n")
+    
+    # Al finalizar el entrenamiento, generar gráficas automáticamente
+    logging.info("="*60)
+    logging.info("Generando gráficas de entrenamiento...")
+    logging.info("="*60)
+    
+    try:
+        log_csv_path = f'training_log/{args.name}/train_log.csv'
+        result = subprocess.run(
+            ['python', 'plot_training.py', '--log_path', log_csv_path, '--save_dir', f'training_log/{args.name}'],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        logging.info(f"   Graphs saved in: training_log/{args.name}/")
+        if result.stdout:
+            logging.info(result.stdout)
+    except subprocess.CalledProcessError as e:
+        logging.warning(f"⚠️  Error al generar gráficas: {e}")
+        if e.stderr:
+            logging.warning(e.stderr)
+    except FileNotFoundError:
+        logging.warning("⚠️  No se encontró plot_training.py")
+    
+    logging.info("="*60)
+    logging.info("ENTRENAMIENTO COMPLETADO")
+    logging.info("="*60)
 
 if __name__ == "__main__":
     # Arguments

@@ -1,10 +1,22 @@
+import random
+import numpy as np
 import torch
 import logging
 import glob
-import random
-import numpy as np
 from torch.utils.data import Dataset
 from torch.nn import functional as F
+
+def __getitem__(self, idx):
+        data = np.load(self.data_list[idx])
+        ego = data['ego']
+        neighbors = data['neighbors']
+        # ref_line = data['ref_line'] 
+        # map_lanes = data['map_lanes']
+        # map_crosswalks = data['map_crosswalks']
+        gt_future_states = data['gt_future_states']
+
+        # return ego, neighbors, map_lanes, map_crosswalks, ref_line, gt_future_states
+        return ego, neighbors, gt_future_states
 
 def initLogging(log_file: str, level: str = "INFO"):
     logging.basicConfig(filename=log_file, filemode='w',
@@ -20,6 +32,29 @@ def set_seed(CUR_SEED):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+"""=== Estructura del archivo .npz ===
+Keys disponibles: ['ego', 'neighbors', 'gt_future_states']
+
+ego:
+  - Shape: (8, 8)
+  - Dtype: float32
+  - Primeros valores:
+[0.18889 0.38368]
+
+neighbors:
+  - Shape: (10, 8, 9)
+  - Dtype: float32
+  - Primeros valores:
+[ 0.65      0.48958  -0.004028 -0.001041  0.      ]
+
+gt_future_states:
+  - Shape: (11, 50, 3)
+  - Dtype: float32
+  - Primeros valores:
+[0.19167   0.38368   2.2462397]"""
+
+
 class DrivingData(Dataset):
     def __init__(self, data_dir):
         self.data_list = glob.glob(data_dir)
@@ -28,22 +63,93 @@ class DrivingData(Dataset):
         return len(self.data_list)
 
     def __getitem__(self, idx):
-        data = np.load(self.data_list[idx])
-        ego = data['ego']
-        neighbors = data['neighbors']
-        ref_line = data['ref_line'] 
-        map_lanes = data['map_lanes']
-        map_crosswalks = data['map_crosswalks']
-        gt_future_states = data['gt_future_states']
+        try:
+            data = np.load(self.data_list[idx])
+            ego = data['ego']
+            neighbors = data['neighbors']
+            gt_future_states = data['gt_future_states']
+        except (ValueError, TypeError, KeyError):
+            # Si hay problema con este archivo, intentar con el siguiente
+            return self.__getitem__((idx + 1) % len(self.data_list))
+        
+        # ========== FILTRAR DATOS INVÁLIDOS ==========
+        # Si el ego está completamente vacío (todo ceros), saltar este sample
+        if np.all(ego == 0):
+            return self.__getitem__((idx + 1) % len(self.data_list))
+        
+        # ref_line = data['ref_line'] 
+        # map_lanes = data['map_lanes']
+        # map_crosswalks = data['map_crosswalks']
 
-        return ego, neighbors, map_lanes, map_crosswalks, ref_line, gt_future_states
+        # ========== NORMALIZACIÓN AL SISTEMA DE REFERENCIA DEL EGO ==========
+        # Obtener posición y orientación actual del ego (último frame observado)
+        ego_current_pos = ego[-1, :2].copy()  # (x, y)
+        ego_current_heading = ego[-1, 2].copy()  # theta
+        
+        cos_h = np.cos(-ego_current_heading)
+        sin_h = np.sin(-ego_current_heading)
+        
+        # 1. Normalizar ego
+        ego[:, :2] = ego[:, :2] - ego_current_pos  # trasladar
+        # Rotar posiciones
+        x_rot = ego[:, 0] * cos_h - ego[:, 1] * sin_h
+        y_rot = ego[:, 0] * sin_h + ego[:, 1] * cos_h
+        ego[:, 0] = x_rot
+        ego[:, 1] = y_rot
+        # Rotar heading
+        ego[:, 2] = ego[:, 2] - ego_current_heading
+        # Rotar velocidades si existen
+        if ego.shape[1] > 4:
+            vx_rot = ego[:, 3] * cos_h - ego[:, 4] * sin_h
+            vy_rot = ego[:, 3] * sin_h + ego[:, 4] * cos_h
+            ego[:, 3] = vx_rot
+            ego[:, 4] = vy_rot
+        
+        # 2. Normalizar vecinos
+        for i in range(neighbors.shape[0]):
+            if neighbors[i, -1, 0] != 0:  # si el vecino existe
+                neighbors[i, :, :2] = neighbors[i, :, :2] - ego_current_pos
+                x_rot = neighbors[i, :, 0] * cos_h - neighbors[i, :, 1] * sin_h
+                y_rot = neighbors[i, :, 0] * sin_h + neighbors[i, :, 1] * cos_h
+                neighbors[i, :, 0] = x_rot
+                neighbors[i, :, 1] = y_rot
+                neighbors[i, :, 2] = neighbors[i, :, 2] - ego_current_heading
+                if neighbors.shape[2] > 4:
+                    vx_rot = neighbors[i, :, 3] * cos_h - neighbors[i, :, 4] * sin_h
+                    vy_rot = neighbors[i, :, 3] * sin_h + neighbors[i, :, 4] * cos_h
+                    neighbors[i, :, 3] = vx_rot
+                    neighbors[i, :, 4] = vy_rot
+        
+        # 3. Normalizar ground truth
+        for i in range(gt_future_states.shape[0]):
+            if np.any(gt_future_states[i] != 0):
+                gt_future_states[i, :, :2] = gt_future_states[i, :, :2] - ego_current_pos
+                x_rot = gt_future_states[i, :, 0] * cos_h - gt_future_states[i, :, 1] * sin_h
+                y_rot = gt_future_states[i, :, 0] * sin_h + gt_future_states[i, :, 1] * cos_h
+                gt_future_states[i, :, 0] = x_rot
+                gt_future_states[i, :, 1] = y_rot
+                if gt_future_states.shape[2] > 2:
+                    gt_future_states[i, :, 2] = gt_future_states[i, :, 2] - ego_current_heading
+        # ========== FIN NORMALIZACIÓN ==========
+        
+        # Pad or truncate gt_future_states to 12 frames
+        if gt_future_states.shape[1] < 12:
+            pad_length = 12 - gt_future_states.shape[1]
+            padding = np.zeros((gt_future_states.shape[0], pad_length, gt_future_states.shape[2]))
+            gt_future_states = np.concatenate([gt_future_states, padding], axis=1)
+        elif gt_future_states.shape[1] > 12:
+            gt_future_states = gt_future_states[:, :12, :]
+
+        # return ego, neighbors, map_lanes, map_crosswalks, ref_line, gt_future_states
+        return ego, neighbors, gt_future_states
 
 def MFMA_loss(plans, predictions, scores, ground_truth, weights):
     global best_mode
 
     predictions = predictions * weights.unsqueeze(1)
-    prediction_distance = torch.norm(predictions[:, :, :, 9::10, :2] - ground_truth[:, None, 1:, 9::10, :2], dim=-1)
-    plan_distance = torch.norm(plans[:, :, 9::10, :2] - ground_truth[:, None, 0, 9::10, :2], dim=-1)
+    # Cambiar 9::10 a usar más frames para 12 timesteps (usar frames 5 y 11)
+    prediction_distance = torch.norm(predictions[:, :, :, [5, 11], :2] - ground_truth[:, None, 1:, [5, 11], :2], dim=-1)
+    plan_distance = torch.norm(plans[:, :, [5, 11], :2] - ground_truth[:, None, 0, [5, 11], :2], dim=-1)
     prediction_distance = prediction_distance.mean(-1).sum(-1)
     plan_distance = plan_distance.mean(-1)
 
@@ -61,8 +167,24 @@ def MFMA_loss(plans, predictions, scores, ground_truth, weights):
     return 0.5 * prediction_loss + score_loss
 
 def select_future(plans, predictions, scores):
-    plan = torch.stack([plans[i, m] for i, m in enumerate(best_mode)])
-    prediction = torch.stack([predictions[i, m] for i, m in enumerate(best_mode)])
+    """
+    Seleccionar el mejor futuro basado en los scores
+    
+    Args:
+        plans: (batch, num_modes, pred_len, features)
+        predictions: (batch, num_modes, num_neighbors, pred_len, features)
+        scores: (batch, num_modes)
+    """
+    # Si best_mode ya fue calculado por MFMA_loss, usarlo
+    global best_mode
+    if 'best_mode' in globals() and best_mode is not None:
+        plan = torch.stack([plans[i, m] for i, m in enumerate(best_mode)])
+        prediction = torch.stack([predictions[i, m] for i, m in enumerate(best_mode)])
+    else:
+        # En inferencia, seleccionar el modo con mayor score
+        best_mode_infer = torch.argmax(scores, dim=-1)
+        plan = torch.stack([plans[i, m] for i, m in enumerate(best_mode_infer)])
+        prediction = torch.stack([predictions[i, m] for i, m in enumerate(best_mode_infer)])
 
     return plan, prediction
 
@@ -109,33 +231,68 @@ def project_to_cartesian_frame(traj, ref_line):
     return xy
 
 def bicycle_model(control, current_state):
-    dt = 0.1 # discrete time period [s]
-    max_delta = 0.6 # vehicle's steering limits [rad]
-    max_a = 5 # vehicle's accleration limits [m/s^2]
-
-    x_0 = current_state[:, 0] # vehicle's x-coordinate [m]
-    y_0 = current_state[:, 1] # vehicle's y-coordinate [m]
-    theta_0 = current_state[:, 2] # vehicle's heading [rad]
-    v_0 = torch.hypot(current_state[:, 3], current_state[:, 4]) # vehicle's velocity [m/s]
-    L = 3.089 # vehicle's wheelbase [m]
-    a = control[:, :, 0].clamp(-max_a, max_a) # vehicle's accleration [m/s^2]
-    delta = control[:, :, 1].clamp(-max_delta, max_delta) # vehicle's steering [rad]
-
-    # speed
-    v = v_0.unsqueeze(1) + torch.cumsum(a * dt, dim=1)
-    v = torch.clamp(v, min=0)
-
-    # angle
-    d_theta = v * delta / L # use delta to approximate tan(delta)
-    theta = theta_0.unsqueeze(1) + torch.cumsum(d_theta * dt, dim=-1)
-    theta = torch.fmod(theta, 2*torch.pi)
+    """
+    Modelo cinemático adaptado para peatones
+    Para datos de peatones: current_state = [x, y, vx, vy, ax, ay, 0, 0]
+    """
+    dt = 0.4 # discrete time period [s] (para 2.5 fps = 1/2.5 = 0.4s)
     
-    # x and y coordniate
-    x = x_0.unsqueeze(1) + torch.cumsum(v * torch.cos(theta) * dt, dim=-1)
-    y = y_0.unsqueeze(1) + torch.cumsum(v * torch.sin(theta) * dt, dim=-1)
+    # Para peatones, usar modelo de punto de masa simple
+    x_0 = current_state[:, 0]  # x inicial
+    y_0 = current_state[:, 1]  # y inicial
     
-    # output trajectory
-    traj = torch.stack([x, y, theta, v], dim=-1)
+    # Verificar si tenemos theta (vehículos) o velocidades (peatones)
+    # Si current_state tiene 8 features y las posiciones 2-3 son velocidades
+    if current_state.shape[1] >= 4:
+        vx_0 = current_state[:, 2]  # velocidad x
+        vy_0 = current_state[:, 3]  # velocidad y
+        
+        # Control para peatones: [ax, ay] (aceleraciones)
+        ax = control[:, :, 0]  # aceleración en x
+        ay = control[:, :, 1]  # aceleración en y
+        
+        # Integrar velocidades
+        vx = vx_0.unsqueeze(1) + torch.cumsum(ax * dt, dim=1)
+        vy = vy_0.unsqueeze(1) + torch.cumsum(ay * dt, dim=1)
+        
+        # Integrar posiciones
+        x = x_0.unsqueeze(1) + torch.cumsum(vx * dt, dim=-1)
+        y = y_0.unsqueeze(1) + torch.cumsum(vy * dt, dim=-1)
+        
+        # Calcular heading desde velocidades
+        theta = torch.atan2(vy, vx)
+        
+        # Velocidad escalar
+        v = torch.hypot(vx, vy)
+        
+        # output trajectory [x, y, theta, v]
+        traj = torch.stack([x, y, theta, v], dim=-1)
+    else:
+        # Modo vehículo original
+        max_delta = 0.6  # vehicle's steering limits [rad]
+        max_a = 5  # vehicle's acceleration limits [m/s^2]
+        
+        theta_0 = current_state[:, 2]  # vehicle's heading [rad]
+        v_0 = torch.hypot(current_state[:, 3], current_state[:, 4]) if current_state.shape[1] > 4 else current_state[:, 3]
+        L = 3.089  # vehicle's wheelbase [m]
+        a = control[:, :, 0].clamp(-max_a, max_a)
+        delta = control[:, :, 1].clamp(-max_delta, max_delta)
+        
+        # speed
+        v = v_0.unsqueeze(1) + torch.cumsum(a * dt, dim=1)
+        v = torch.clamp(v, min=0)
+        
+        # angle
+        d_theta = v * delta / L
+        theta = theta_0.unsqueeze(1) + torch.cumsum(d_theta * dt, dim=-1)
+        theta = torch.fmod(theta, 2*torch.pi)
+        
+        # x and y coordinate
+        x = x_0.unsqueeze(1) + torch.cumsum(v * torch.cos(theta) * dt, dim=-1)
+        y = y_0.unsqueeze(1) + torch.cumsum(v * torch.sin(theta) * dt, dim=-1)
+        
+        # output trajectory
+        traj = torch.stack([x, y, theta, v], dim=-1)
 
     return traj
 
