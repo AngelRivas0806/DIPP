@@ -26,36 +26,38 @@ Install the [Theseus library](https://github.com/facebookresearch/theseus), foll
 
 ## Usage
 ### Data Processing
-Run ```process_eth_ucy.py``` to process the raw data for training. This will convert the original data format into a set of ```.npz``` files, each containing the data of a scene with the ego (first pedestrian of the tensor) and surrounding pedestrian. You need to specify the file path to the original data ```--load_path``` and the path to save the processed data ```--save_path``` . Example with Zara1: 
+Run ```process_eth_ucy.py``` to process the raw data for training and validation (If you need it). This will convert the original data format into a set of ```.npz``` files, each containing the data of a scene with the ego (first pedestrian of the tensor) and surrounding pedestrian. You need to specify the file path to the original data ```--load_path``` and the path to save the processed data ```--save_path``` . Example with Zara02: 
 ```shell
-python process_eth_ucy.py \
- --dataset datasets/ucy-zara01/pixel_pos.csv \
- --output data/processed_data_zara01 \
- --fps 2.5 \
- --split \
+python process_eth_ucy.py 
+--process_all 
+--leave_out ucy-zara02 /
+--output data/processed_leave_zara02_out /
+--split
 ```
 
 ### Training
 Run ```train.py``` to learn the predictor and planner (if set ```--use_planning```). You need to specify the file paths to training data ```--train_set``` and validation data ```--valid_set```. Leave other arguments vacant to use the default setting. Example with Zara1: 
 ```shell
 python train.py \
---name zara01_model \
---train_set data/processed_data_zara01_train \
---valid_set data/processed_data_zara01_val \
---train_epochs 30 \
---batch_size 4 \
---learning_rate 0.00005 \
---use_planning
+--name leave_zara02_out \
+--train_set data/processed_leave_zara02_out/train_combined \
+--valid_set data/processed_leave_zara02_out/val_combined \
+--pretrain_epochs 5 \
+--train_epochs 20 \
+--batch_size 32 \
+--learning_rate 2e-4 \
+--device cuda
 ```
 
 ### Open-loop testing
 Run ```test_eth_ucy.py``` to test the trained planner in an open-loop manner. You need to specify the path to the original test dataset ```--test_set``` (path to the folder) and also the file path to the trained model ```--model_path```. Set ```--render``` to visualize the results and set ```--save``` to save the rendered images.
 ```shell
 python test_eth_ucy.py \
---model_path training_log/zara01_model/model_10_0.1997.pth \
---test_set data/processed_data_zara01_test \
---name zara01_test_final \
---use_planning \
+--model_path training_log/leave_zara02_out_no_planning/model_11_0.1589.pth \
+--test_set data/processed_leave_zara02_out/test \
+--name leave_zara02_out_test \
+--batch_size 32 \
+--device cuda \
 --visualize \
 --num_vis_samples 20
 ```

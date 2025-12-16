@@ -2,6 +2,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+# Número de modos/futuros posibles para predicción multimodal
+NUM_MODES = 20
+
 """Agent history encoder
 # Encodes the historical trajectory of a pedestrian using an LSTM network."""
 
@@ -86,7 +89,7 @@ In our case, itsn't necessary the classes because are relation with map elements
     #     return output
 """Multi-modal transformer module is used for agen2map, so we commented that code , we modified agent2agent to use it as well"""
 class MultiModalTransformer(nn.Module):
-    def __init__(self, modes=3, output_dim=256):
+    def __init__(self, modes=NUM_MODES, output_dim=256):
         super(MultiModalTransformer, self).__init__()
         self.modes = modes
         self.attention = nn.ModuleList([nn.MultiheadAttention(256, 4, 0.1, batch_first=True) for _ in range(modes)])
@@ -120,7 +123,7 @@ class MultiModalTransformer(nn.Module):
 
 
 class Agent2Agent(nn.Module):
-    def __init__(self, modes=3):
+    def __init__(self, modes=NUM_MODES):
         super(Agent2Agent, self).__init__()
         self.modes = modes
         
@@ -128,18 +131,18 @@ class Agent2Agent(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(d_model=256, nhead=8, dim_feedforward=1024, activation='relu', batch_first=True)
         self.interaction_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
-        # Multi-modal attention to generate 3 interpretations
-        self.multimodal = MultiModalTransformer(modes=3, output_dim=256)
+        # Multi-modal attention to generate multiple interpretations
+        self.multimodal = MultiModalTransformer(modes=modes, output_dim=256)
         
     def forward(self, inputs, mask=None):
         # Step 1: Encode basic interactions
         encoded = self.interaction_net(inputs, src_key_padding_mask=mask)
         # encoded: (batch, num_agents, 256)
 
-        # Step 2: Generate 3 modes using self-attention
+        # Step 2: Generate NUM_MODES modes using self-attention
         query = encoded  # (batch, num_agents, 256)
         output = self.multimodal(query, encoded, encoded, mask)
-        # output: (batch, 3, num_agents, 256)
+        # output: (batch, NUM_MODES, num_agents, 256)
         
         return output
     
@@ -164,9 +167,11 @@ class Agent2Agent(nn.Module):
 """Decoders"""
 
 class AgentDecoder(nn.Module):
-    def __init__(self, future_steps):
+    def __init__(self, future_steps, num_neighbors=10, num_modes=NUM_MODES):
         super(AgentDecoder, self).__init__()
         self._future_steps = future_steps 
+        self._num_neighbors = num_neighbors
+        self._num_modes = num_modes
         self.decode = nn.Sequential(nn.Dropout(0.1), nn.Linear(256, 256), nn.ELU(), nn.Linear(256, future_steps*3))
 
     def transform(self, prediction, current_state):
@@ -184,9 +189,11 @@ class AgentDecoder(nn.Module):
         return traj
        
     def forward(self, agent_agent, current_state):
-        decoded = self.decode(agent_agent).view(-1, 3, 10, self._future_steps, 3)
-        trajs = torch.stack([self.transform(decoded[:, i, j], current_state[:, j]) for i in range(3) for j in range(10)], dim=1)
-        trajs = torch.reshape(trajs, (-1, 3, 10, self._future_steps, 3))
+        decoded = self.decode(agent_agent).view(-1, self._num_modes, self._num_neighbors, self._future_steps, 3)
+        trajs = torch.stack([self.transform(decoded[:, i, j], current_state[:, j]) for i in range(self._num_modes) for j in range(self._num_neighbors)], dim=1)
+        trajs = torch.reshape(trajs, (-1, self._num_modes, self._num_neighbors, self._future_steps, 3))
+
+        return trajs
 
         return trajs
 
@@ -209,22 +216,31 @@ class AgentDecoder(nn.Module):
     #     return actions, cost_function_weights
 
 class AVDecoder(nn.Module):
-    def __init__(self, future_steps=12, feature_len=9):
+    def __init__(self, future_steps=12, feature_len=9, num_modes=NUM_MODES):
         super(AVDecoder, self).__init__()
         self._future_steps = future_steps
+        self._num_modes = num_modes
         # Output control variables (acceleration and steering) instead of trajectories
-        self.control = nn.Sequential(nn.Dropout(0.1), nn.Linear(256, 256), nn.ELU(), nn.Linear(256, future_steps*2))
-        self.cost = nn.Sequential(nn.Linear(1, 128), nn.ReLU(), nn.Linear(128, feature_len), nn.Softmax(dim=-1))
-        self.register_buffer('scale', torch.tensor([1, 1, 1, 1, 1, 10, 100]))
-        self.register_buffer('constraint', torch.tensor([[10, 10]]))
+        self.control = nn.Sequential(
+            nn.Dropout(0.1),
+            nn.Linear(256, 256),
+            nn.ELU(),
+            nn.Linear(256, future_steps*2)
+        )
+        self.cost_weights = nn.Parameter(torch.ones(feature_len, dtype=torch.float32))
+        self.register_buffer('scale', torch.tensor([1, 1, 1, 1, 1, 10, 100], dtype=torch.float32))
+        self.register_buffer('constraint', torch.tensor([[10, 10]], dtype=torch.float32))
 
     def forward(self, agent_agent, current_state):
-        # Generate control variables for 3 modes
-        actions = self.control(agent_agent).view(-1, 3, self._future_steps, 2)
-        
-        # Generate cost function weights
-        dummy = torch.ones(1, 1).to(self.cost[0].weight.device)
-        cost_function_weights = torch.cat([self.cost(dummy)[:, :7] * self.scale, self.constraint], dim=-1)
+        # Generate control variables for num_modes modes
+        actions = self.control(agent_agent).view(-1, self._num_modes, self._future_steps, 2)
+
+        # Generate cost function weights (global, learnable)
+        norm_weights = torch.softmax(self.cost_weights, dim=0)  # (feature_len,)
+        scaled_weights = norm_weights[:7] * self.scale  # (7,)
+        cost_function_weights = torch.cat([scaled_weights, self.constraint[0]], dim=-1)  # (9,)
+        # Expand to batch dimension for compatibility
+        cost_function_weights = cost_function_weights.unsqueeze(0).expand(actions.shape[0], -1)  # (B, 9)
 
         return actions, cost_function_weights
 
@@ -250,16 +266,17 @@ class AVDecoder(nn.Module):
     #     return scores
 
 class Score(nn.Module):
-    def __init__(self):
+    def __init__(self, num_modes=NUM_MODES):
         super(Score, self).__init__()
+        self._num_modes = num_modes
         self.decode = nn.Sequential(nn.Dropout(0.1), nn.Linear(256, 128), nn.ELU(), nn.Linear(128, 1))
 
     def forward(self, agent_agent):
-        # agent_agent: (batch, 3, num_agents, 256)
+        # agent_agent: (batch, num_modes, num_agents, 256)
         # Pooling over all agents for each mode
-        agent_pooled = torch.max(agent_agent, dim=2)[0]  # (batch, 3, 256)
-        scores = self.decode(agent_pooled).squeeze(-1)  # (batch, 3)
-        # scores → (batch, 3)
+        agent_pooled = torch.max(agent_agent, dim=2)[0]  # (batch, num_modes, 256)
+        scores = self.decode(agent_pooled).squeeze(-1)  # (batch, num_modes)
+        # scores → (batch, num_modes)
         return scores
 
 # Build predictor
@@ -385,7 +402,7 @@ class Score(nn.Module):
 #         return plans, predictions, scores, cost_function_weights
 
 class Predictor(nn.Module):
-    def __init__(self, future_steps, num_neighbors=10, num_modes=3):
+    def __init__(self, future_steps, num_neighbors=10, num_modes=NUM_MODES):
         super(Predictor, self).__init__()
         self._future_steps = future_steps
         self._num_neighbors = num_neighbors
@@ -398,13 +415,13 @@ class Predictor(nn.Module):
         self.agent_agent = Agent2Agent(modes=num_modes)
 
         # Planner tipo DIPP para el ego (usa solo info social ahora)
-        self.plan = AVDecoder(future_steps=self._future_steps)
+        self.plan = AVDecoder(future_steps=self._future_steps, num_modes=num_modes)
 
         # Decoder de trayectorias futuras para los vecinos
-        self.predict = AgentDecoder(future_steps=self._future_steps)
+        self.predict = AgentDecoder(future_steps=self._future_steps, num_neighbors=num_neighbors, num_modes=num_modes)
 
         # Score multimodal (tu versión sin mapa)
-        self.score = Score()
+        self.score = Score(num_modes=num_modes)
 
     def forward(self, ego, neighbors):
         """

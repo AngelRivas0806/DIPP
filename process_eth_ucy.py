@@ -1,21 +1,18 @@
 """
-Script para procesar datasets ETH/UCY desde CSV a formato .npz
-Compatible con el modelo DIPP
+Script to process ETH/UCY datasets from CSV to .npz format
 
-Formato de entrada: CSV con columnas [frame, ped_id, x, y]
-Formato de salida: .npz con keys [ego, neighbors, gt_future_states]
 
-Uso:
-    python process_eth_ucy.py --dataset datasets/ucy-zara01/pixel_pos.csv --output data/processed_data_zara01 --fps 2.5 --split
-"""
-"""=== Estructura del archivo .npz procesado ===
-Keys disponibles: ['ego', 'neighbors', 'gt_future_states']
+Input format: CSV with columns [frame, ped_id, x, y] in WORLD COORDINATES (meters)
+Output format: .npz with keys [ego, neighbors, gt_future_states]
+
+=== Structure of the processed .npz file ===
+Available keys: ['ego', 'neighbors', 'gt_future_states']
 
 ego:
   - Shape: (8, 8)
   - Dtype: float32
   - Min/Max: -0.0847 / 0.8875
-  - Primeras 2 posiciones:
+  - First 2 positions:
 [[ 0.8875    0.71354  -0.084725  0.      ]
  [ 0.85361   0.71354  -0.084725  0.      ]]
 
@@ -35,84 +32,87 @@ import argparse
 import os
 from tqdm import tqdm
 import glob
+import shutil
 
 
 class ETHUCYProcessor:
     def __init__(self, obs_len=8, pred_len=12, fps=2.5, num_neighbors=10):
         """
         Args:
-            obs_len: Número de frames de observación (historia)
-            pred_len: Número de frames de predicción (futuro)
-            fps: Frames por segundo del dataset
-            num_neighbors: Número máximo de vecinos a considerar
+            obs_len: Number of observation frames (history)
+            pred_len: NNumber of prediction frames (future)
+            fps: Frames per second of the dataset
+            num_neighbors: Maximum number of neighbors to consider
         """
         self.obs_len = obs_len
         self.pred_len = pred_len
         self.total_len = obs_len + pred_len
         self.fps = fps
-        self.dt = 1.0 / fps  # tiempo entre frames
+        self.dt = 1.0 / fps  # time between frames
         self.num_neighbors = num_neighbors
         
     def load_csv(self, csv_path):
-        """Cargar CSV con formato [frame, ped_id, x, y]"""
+        """
+        Load CSV with format [frame, ped_id, x, y]
+        """
         df = pd.read_csv(csv_path, header=None, names=['frame', 'ped_id', 'x', 'y'])
         return df
     
     def compute_velocity(self, positions):
-        """Calcular velocidades a partir de posiciones"""
+        """Compute velocities from positions"""
         if len(positions) < 2:
             return np.zeros((len(positions), 2))
         
         velocities = np.zeros_like(positions)
         velocities[1:] = (positions[1:] - positions[:-1]) / self.dt
-        velocities[0] = velocities[1]  # usar la siguiente velocidad para el primer frame
+        velocities[0] = velocities[1]  # use first valid velocity for the first frame
         return velocities
     
     def get_trajectory(self, df, ped_id, start_frame, end_frame, frame_step=10):
         """
-        Extraer trayectoria de un peatón en un rango de frames
-        
+        Extract trajectory of a pedestrian over a range of frames
+
         Args:
-            frame_step: Paso entre frames (10 para ETH/UCY que están muestreados cada 10 frames)
-        
+            frame_step: Step between frames (10 for ETH/UCY which are sampled every 10 frames)
+
         Returns:
-            traj: array de shape (num_frames, 8) con [x, y, vx, vy, ax, ay, 0, 0]
-                  o None si no hay suficientes datos
+            traj: array of shape (num_frames, 8) with [x, y, vx, vy, ax, ay, 0, 0]
+                  or None if there is not enough data
         """
         frames = np.arange(start_frame, end_frame, frame_step)
         ped_data = df[(df['ped_id'] == ped_id) & (df['frame'].isin(frames))]
-        
-        # Verificar que tenemos todos los frames
+
+        # Check if we have all frames
         if len(ped_data) != len(frames):
             return None
-        
-        # Ordenar por frame
+
+        # Sort by frame
         ped_data = ped_data.sort_values('frame')
-        
-        # Extraer posiciones
+
+        # Extract positions
         positions = ped_data[['x', 'y']].values
-        
-        # Calcular velocidades
+
+        # Compute velocities
         velocities = self.compute_velocity(positions)
-        
-        # Calcular aceleraciones
+
+        # Compute accelerations
         accelerations = self.compute_velocity(velocities)
-        
-        # Construir array de features [x, y, vx, vy, ax, ay, 0, 0]
-        # Los últimos 2 campos son para compatibilidad (pueden ser heading, type, etc.)
+
+        # Build feature array [x, y, vx, vy, ax, ay, 0, 0]
+        # The last 2 fields are for compatibility (can be heading, type, etc.)
         traj = np.zeros((len(frames), 8))
         traj[:, 0:2] = positions
         traj[:, 2:4] = velocities
         traj[:, 4:6] = accelerations
-        # traj[:, 6] = 0  # reservado (puede ser heading)
-        # traj[:, 7] = 0  # reservado (puede ser tipo de agente)
-        
+        # traj[:, 6] = 0  # reserved (can be heading)
+        # traj[:, 7] = 0  # reserved (can be agent type)
+
         return traj
     
     def get_neighbors(self, df, ego_id, center_frame, max_neighbors=10, frame_step=10):
         """
-        Obtener los N vecinos más cercanos al ego en el frame central
-        
+        Get the N closest neighbors to the ego in the center frame
+
         Returns:
             neighbors: array de shape (max_neighbors, total_len, 9) 
                       [x, y, vx, vy, ax, ay, 0, 0, valid_flag]
@@ -258,38 +258,214 @@ class ETHUCYProcessor:
         return sample_count
 
 
-def process_all_datasets(datasets_dir, output_base_dir):
-    """Procesar todos los datasets encontrados"""
+def process_all_datasets(datasets_dir, output_base_dir, leave_out=None, split=False, 
+                         train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+    """
+    Process all found datasets (with option to exclude one for Leave-One-Out)
+
+    Args:
+        datasets_dir: Directory with datasets
+        output_base_dir: Output directory
+        leave_out: Dataset to exclude (for Leave-One-Out). Ej: 'zara01', 'eth-hotel'
+        split: If it should split into train/val/test
+        train_ratio, val_ratio, test_ratio: Proportions for split
+        seed: Seed for reproducibility
+    """
     
     processor = ETHUCYProcessor(obs_len=8, pred_len=12, fps=2.5, num_neighbors=10)
     
-    # Buscar todos los CSV
-    csv_files = []
-    for dataset in ['eth-hotel', 'eth-univ', 'ucy-zara01', 'ucy-zara02', 'ucy-univ']:
-        csv_path = f"{datasets_dir}/{dataset}/pixel_pos.csv"
-        if os.path.exists(csv_path):
-            csv_files.append((dataset, csv_path))
+    # All available datasets
+    all_datasets = ['eth-hotel', 'eth-univ', 'ucy-zara01', 'ucy-zara02', 'ucy-univ']
     
-    if not csv_files:
+    # Search for CSV files in world/mun_pos.csv
+    all_csv_files = []
+    for dataset in all_datasets:
+        csv_path = f"{datasets_dir}/{dataset}/mundo/mun_pos.csv"
+        if os.path.exists(csv_path):
+            all_csv_files.append((dataset, csv_path))
+    
+    if not all_csv_files:
         print("No se encontraron archivos CSV")
         return
     
-    print(f"\nDatasets encontrados: {len(csv_files)}")
-    for name, path in csv_files:
-        print(f"  - {name}: {path}")
+    # Separar datasets de entrenamiento y test
+    train_csv_files = []
+    test_csv_file = None
     
-    # Procesar cada dataset
+    if leave_out:
+        print(f"\n{'='*60}")
+        print(f"MODO: Leave-One-Out (excluyendo '{leave_out}' para TEST)")
+        print(f"{'='*60}")
+        
+        for name, path in all_csv_files:
+            if name == leave_out:
+                test_csv_file = (name, path)
+            else:
+                train_csv_files.append((name, path))
+        
+        if len(train_csv_files) == 0:
+            print(f"Error: No hay datasets para procesar después de excluir '{leave_out}'")
+            return
+    else:
+        train_csv_files = all_csv_files
+    
+    print(f"\nDatasets de ENTRENAMIENTO: {len(train_csv_files)}")
+    for name, path in train_csv_files:
+        print(f"  ✓ {name}")
+    
+    if test_csv_file:
+        print(f"\nDataset de TEST:")
+        print(f"{test_csv_file[0]}")
+    
+    #=========================================================
+    # PASO 1: Procesar y combinar datasets de entrenamiento
+    #=========================================================
+    print(f"\n{'='*60}")
+    print(f"PASO 1/3: Procesando y combinando datasets de ENTRENAMIENTO")
+    print(f"{'='*60}\n")
+    
+    # Crear directorio temporal combinado
+    combined_temp_dir = f"{output_base_dir}/combined_temp"
+    os.makedirs(combined_temp_dir, exist_ok=True)
+    
     total_samples = 0
-    for dataset_name, csv_path in csv_files:
-        output_dir = f"{output_base_dir}/{dataset_name}"
-        samples = processor.process_dataset(csv_path, output_dir)
+    sample_counter = 0
+    
+    for dataset_name, csv_path in train_csv_files:
+        print(f"\nProcesando: {dataset_name}")
+        
+        # Procesar dataset temporalmente
+        temp_output_dir = f"{output_base_dir}/{dataset_name}_temp"
+        samples = processor.process_dataset(csv_path, temp_output_dir)
+        
+        # Copiar archivos al directorio combinado con numeración secuencial
+        print(f"Combinando {samples} muestras de {dataset_name}...")
+        temp_files = sorted(glob.glob(os.path.join(temp_output_dir, "*.npz")))
+        for src_file in tqdm(temp_files, desc=f"  → combined_temp", leave=False):
+            dst_file = os.path.join(combined_temp_dir, f"sample_{sample_counter:05d}.npz")
+            shutil.move(src_file, dst_file)
+            sample_counter += 1
+        
+        # Eliminar directorio temporal
+        os.rmdir(temp_output_dir)
         total_samples += samples
     
     print(f"\n{'='*60}")
-    print(f"RESUMEN FINAL")
-    print(f"  - Total de muestras generadas: {total_samples}")
-    print(f"  - Datasets procesados: {len(csv_files)}")
+    print(f"Datasets combinados: {total_samples} muestras")
     print(f"{'='*60}\n")
+    
+    #=========================================================
+    # PASO 2: Dividir en train/val/test si aplica
+    #=========================================================
+    if split:
+        print(f"{'='*60}")
+        print(f"PASO 2/3: Dividiendo datos combinados en train/val")
+        print(f"{'='*60}\n")
+        
+        # Dividir el directorio combinado (solo train y val, sin test)
+        train_combined_dir = f"{output_base_dir}/train_combined"
+        val_combined_dir = f"{output_base_dir}/val_combined"
+        
+        os.makedirs(train_combined_dir, exist_ok=True)
+        os.makedirs(val_combined_dir, exist_ok=True)
+        
+        # Obtener todos los archivos
+        all_files = sorted(glob.glob(os.path.join(combined_temp_dir, "*.npz")))
+        n_total = len(all_files)
+        
+        # Mezclar con semilla
+        np.random.seed(seed)
+        indices = np.arange(n_total)
+        np.random.shuffle(indices)
+        
+        # Calcular división (ajustar proporciones ya que no hay test)
+        # train_ratio y val_ratio se normalizan para sumar 1.0
+        total_ratio = train_ratio + val_ratio
+        adjusted_train_ratio = train_ratio / total_ratio
+        
+        n_train = int(n_total * adjusted_train_ratio)
+        
+        train_indices = indices[:n_train]
+        val_indices = indices[n_train:]
+        
+        print(f"Total de muestras combinadas: {n_total}")
+        print(f"División (seed={seed}):")
+        print(f"  - Train: {len(train_indices)} muestras ({len(train_indices)/n_total*100:.1f}%)")
+        print(f"  - Val:   {len(val_indices)} muestras ({len(val_indices)/n_total*100:.1f}%)\n")
+        
+        # Copiar archivos train
+        print("Copiando train_combined...")
+        for new_idx, original_idx in enumerate(tqdm(train_indices, desc="  train")):
+            src_file = all_files[original_idx]
+            dst_file = os.path.join(train_combined_dir, f"sample_{new_idx:05d}.npz")
+            shutil.copy2(src_file, dst_file)
+        
+        # Copiar archivos val
+        print("Copiando val_combined...")
+        for new_idx, original_idx in enumerate(tqdm(val_indices, desc="  val")):
+            src_file = all_files[original_idx]
+            dst_file = os.path.join(val_combined_dir, f"sample_{new_idx:05d}.npz")
+            shutil.copy2(src_file, dst_file)
+        
+        # Eliminar directorio temporal
+        import shutil as sh
+        sh.rmtree(combined_temp_dir)
+        
+        print(f"\n División completada:")
+        print(f"  - train_combined/: {len(train_indices)} muestras")
+        print(f"  - val_combined/: {len(val_indices)} muestras")
+        
+        train_counter = len(train_indices)
+        val_counter = len(val_indices)
+    else:
+        # Si no se especifica split, solo renombrar el directorio
+        train_combined_dir = f"{output_base_dir}/combined"
+        shutil.move(combined_temp_dir, train_combined_dir)
+        train_counter = total_samples
+        val_counter = 0
+    
+    #=========================================================
+    # PASO 3: Procesar dataset de test (si aplica)
+     #=========================================================
+    if test_csv_file:
+        print(f"\n{'='*60}")
+        print(f"PASO 3/3: Procesando dataset de TEST ({test_csv_file[0]})")
+        print(f"{'='*60}")
+        
+        test_dataset_name, test_csv_path = test_csv_file
+        test_output_dir = f"{output_base_dir}/test"
+        
+        test_samples = processor.process_dataset(test_csv_path, test_output_dir)
+        
+        print(f"\n Dataset de test procesado:")
+        print(f"  - test/: {test_samples} muestras")
+    
+   #=========================================================
+    print(f"\n{'='*60}")
+    print(f" PROCESAMIENTO COMPLETADO")
+    print(f"{'='*60}")
+    print(f"\n Estructura creada en: {output_base_dir}/")
+    print(f"\n Para ENTRENAMIENTO:")
+    if split:
+        print(f"  ├── train_combined/        ({train_counter} muestras)")
+        print(f"  └── val_combined/          ({val_counter} muestras)")
+    else:
+        print(f"  └── combined/              ({train_counter} muestras)")
+    
+    if test_csv_file:
+        print(f"\n Para TESTING:")
+        print(f"  └── test/   ({test_samples} muestras)")
+    
+    print(f"\n Próximo paso - Entrenar modelo:")
+    if split and test_csv_file:
+        print(f"  python train.py \\")
+        print(f"    --name leave_{test_dataset_name}_out \\")
+        print(f"    --train_set {output_base_dir}/train_combined \\")
+        print(f"    --valid_set {output_base_dir}/val_combined \\")
+        print(f"    --use_planning")
+    print(f"{'='*60}\n")
+    
+    return train_csv_files
 
 
 def split_processed_data(input_dir, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
@@ -385,6 +561,8 @@ if __name__ == "__main__":
     parser.add_argument('--num_neighbors', type=int, default=10, help='Número de vecinos')
     parser.add_argument('--process_all', action='store_true', 
                         help='Procesar todos los datasets en datasets_dir')
+    parser.add_argument('--leave_out', type=str, choices=['eth-hotel', 'eth-univ', 'ucy-zara01', 'ucy-zara02', 'ucy-univ'],
+                        help='Dataset a EXCLUIR del procesamiento (Leave-One-Out). Ej: ucy-zara02')
     parser.add_argument('--split', action='store_true',
                         help='Dividir automáticamente en train/val/test (70/15/15)')
     parser.add_argument('--train_ratio', type=float, default=0.7,
@@ -399,11 +577,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     if args.process_all:
-        # Procesar todos los datasets
-        process_all_datasets(args.datasets_dir, args.output)
-        if args.split:
-            split_processed_data(args.output, args.train_ratio, args.val_ratio, 
-                               args.test_ratio, args.seed)
+        # Procesar todos los datasets (con opción de leave-one-out)
+        process_all_datasets(
+            args.datasets_dir, 
+            args.output,
+            leave_out=args.leave_out,
+            split=args.split,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+            seed=args.seed
+        )
     elif args.dataset:
         # Procesar un dataset específico
         processor = ETHUCYProcessor(
@@ -420,10 +604,28 @@ if __name__ == "__main__":
                                args.test_ratio, args.seed)
     else:
         print("Error: Especifica --dataset o usa --process_all")
-        print("\nEjemplos de uso:")
-        print("  # Procesar un dataset específico:")
-        print("  python process_eth_ucy.py --dataset datasets/ucy-zara01/pixel_pos.csv --output processed_zara01")
-        print("\n  # Procesar Y dividir automáticamente:")
-        print("  python process_eth_ucy.py --dataset datasets/ucy-zara01/pixel_pos.csv --output processed_zara01 --split")
-        print("\n  # Procesar todos los datasets:")
-        print("  python process_eth_ucy.py --process_all --output processed_data_eth_ucy")
+        print("\n" + "="*60)
+        print("EJEMPLOS DE USO")
+        print("="*60)
+        print("\n1. Procesar UN dataset específico (usando coordenadas del mundo en metros):")
+        print("   python process_eth_ucy.py --dataset datasets/ucy-zara01/mundo/mun_pos.csv --output processed_zara01")
+        
+        print("\n2. Procesar UN dataset Y dividir en train/val/test:")
+        print("   python process_eth_ucy.py --dataset datasets/ucy-zara01/mundo/mun_pos.csv --output processed_zara01 --split")
+        
+        print("\n3. Procesar TODOS los datasets (busca automáticamente mundo/mun_pos.csv):")
+        print("   python process_eth_ucy.py --process_all --output processed_data --split")
+        
+        print("\n4. Leave-One-Out: Procesar TODOS EXCEPTO zara02 (para testing):")
+        print("   python process_eth_ucy.py --process_all --leave_out ucy-zara02 --output processed_data --split")
+        
+        print("\n5. Leave-One-Out: Excluir eth-hotel:")
+        print("   python process_eth_ucy.py --process_all --leave_out eth-hotel --output processed_data --split")
+        
+        print("\nDatasets disponibles para --leave_out:")
+        print("  - eth-hotel")
+        print("  - eth-univ")
+        print("  - ucy-zara01")
+        print("  - ucy-zara02")
+        print("  - ucy-univ")
+        print("="*60 + "\n")

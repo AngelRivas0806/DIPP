@@ -12,18 +12,18 @@ class MotionPlanner:
         # define control variable (trajectory_len * 2 for acceleration and steering)
         control_variables = th.Vector(dof=trajectory_len*2, name="control_variables")
         
-        # define prediction variable
+        # define prediction variable (neighbors' predicted trajectories)
         predictions = th.Variable(torch.empty(1, 10, trajectory_len, 3), name="predictions")
-
-        # define ref_line_info
-        ref_line_info = th.Variable(torch.empty(1, 1200, 5), name="ref_line_info")
         
-        # define current state
+        # define current state (ego + neighbors)
         current_state = th.Variable(torch.empty(1, 11, 8), name="current_state")
+        
+        # define ground truth trajectory for trajectory following cost
+        gt_trajectory = th.Variable(torch.empty(1, trajectory_len, 3), name="gt_trajectory")
 
         # set up objective
         objective = th.Objective()
-        self.objective = cost_function(objective, control_variables, current_state, predictions, ref_line_info, cost_function_weights, trajectory_len)
+        self.objective = cost_function(objective, control_variables, current_state, predictions, gt_trajectory, cost_function_weights, trajectory_len)
 
         # set up optimizer
         if test:
@@ -95,6 +95,145 @@ def steering_change(optim_vars, aux_vars):
     steering_change = torch.diff(steering) / 0.1
 
     return steering_change
+
+
+# ============================================================================
+# NEW COST FUNCTIONS FOR PEDESTRIAN TRAJECTORY PLANNING
+# ============================================================================
+
+def collision_avoidance(optim_vars, aux_vars):
+    """
+    Penaliza la cercanía a otros peatones para evitar colisiones.
+    
+    Args:
+        optim_vars[0]: control_variables [batch, 24] -> reshape to [batch, 12, 2]
+        aux_vars[0]: predictions - trayectorias predichas de vecinos [batch, 10, 12, 3]
+        aux_vars[1]: current_state - estado actual [batch, 11, 8]
+    
+    Returns:
+        collision_error: penalización por cercanía [batch, 12]
+    """
+    control = optim_vars[0].tensor.reshape(-1, 12, 2)
+    predictions = aux_vars[0].tensor  # [batch, 10, 12, 3] - vecinos predichos
+    current_state = aux_vars[1].tensor  # [batch, 11, 8]
+    
+    # Generar trayectoria del ego usando bicycle model
+    ego_current_state = current_state[:, 0]  # [batch, 8]
+    ego_traj = bicycle_model(control, ego_current_state)  # [batch, 12, 4] -> [x, y, theta, v]
+    
+    # Extraer solo posiciones del ego
+    ego_pos = ego_traj[:, :, :2]  # [batch, 12, 2]
+    
+    # Extraer posiciones de vecinos
+    neighbors_pos = predictions[:, :, :, :2]  # [batch, 10, 12, 2]
+    
+    # Crear máscara para vecinos válidos (no zeros/padding)
+    # Un vecino es válido si su posición no es todo ceros
+    neighbor_valid_mask = (neighbors_pos.abs().sum(dim=-1).sum(dim=-1) > 0.01)  # [batch, 10]
+    
+    # Distancia mínima de seguridad para peatones (metros)
+    safety_distance = 0.5  # Reducido a 50 cm para ser menos agresivo
+    
+    # Calcular distancias a cada vecino en cada timestep
+    ego_pos_expanded = ego_pos.unsqueeze(1)  # [batch, 1, 12, 2]
+    
+    # Distancia euclidiana a cada vecino
+    distances = torch.norm(ego_pos_expanded - neighbors_pos, dim=-1)  # [batch, 10, 12]
+    
+    # Poner distancia muy grande para vecinos inválidos (padding)
+    distances = torch.where(
+        neighbor_valid_mask.unsqueeze(-1).expand_as(distances),
+        distances,
+        torch.ones_like(distances) * 100.0  # Distancia grande para padding
+    )
+    
+    # Encontrar la distancia mínima a cualquier vecino válido en cada timestep
+    min_distances, _ = torch.min(distances, dim=1)  # [batch, 12]
+    
+    # Penalización: mayor cuando la distancia es menor que safety_distance
+    collision_error = torch.clamp(safety_distance - min_distances, min=0)  # [batch, 12]
+    
+    # Escalar para que el error sea más pequeño (evitar gradientes explosivos)
+    collision_error = collision_error * 0.1
+    
+    return collision_error
+
+
+def goal_reaching(optim_vars, aux_vars):
+    """
+    Penaliza la distancia a la meta (última posición del ground truth).
+    Ayuda a que la trayectoria planificada se dirija hacia el destino.
+    
+    Args:
+        optim_vars[0]: control_variables [batch, 24]
+        aux_vars[0]: gt_trajectory - ground truth [batch, 12, 3]
+        aux_vars[1]: current_state - estado actual [batch, 11, 8]
+    
+    Returns:
+        goal_error: distancia a la meta en el último timestep [batch, 2]
+    """
+    control = optim_vars[0].tensor.reshape(-1, 12, 2)
+    gt_trajectory = aux_vars[0].tensor  # [batch, 12, 3]
+    current_state = aux_vars[1].tensor  # [batch, 11, 8]
+    
+    # Generar trayectoria del ego
+    ego_current_state = current_state[:, 0]  # [batch, 8]
+    ego_traj = bicycle_model(control, ego_current_state)  # [batch, 12, 4]
+    
+    # Posición final predicha
+    final_pos_pred = ego_traj[:, -1, :2]  # [batch, 2]
+    
+    # Posición final del ground truth (la meta)
+    final_pos_gt = gt_trajectory[:, -1, :2]  # [batch, 2]
+    
+    # Error: diferencia entre posición final predicha y la meta
+    goal_error = final_pos_pred - final_pos_gt  # [batch, 2]
+    
+    # Escalar para evitar gradientes explosivos
+    goal_error = goal_error * 0.1
+    
+    return goal_error
+
+
+def trajectory_following(optim_vars, aux_vars):
+    """
+    Penaliza la desviación de la trayectoria ground truth.
+    Ayuda a que la trayectoria planificada siga de cerca la trayectoria real.
+    
+    Args:
+        optim_vars[0]: control_variables [batch, 24]
+        aux_vars[0]: gt_trajectory - ground truth [batch, 12, 3]
+        aux_vars[1]: current_state - estado actual [batch, 11, 8]
+    
+    Returns:
+        traj_error: error de posición en cada timestep [batch, 12] (6 errores x + 6 errores y)
+    """
+    control = optim_vars[0].tensor.reshape(-1, 12, 2)
+    gt_trajectory = aux_vars[0].tensor  # [batch, 12, 3]
+    current_state = aux_vars[1].tensor  # [batch, 11, 8]
+    
+    # Generar trayectoria del ego
+    ego_current_state = current_state[:, 0]  # [batch, 8]
+    ego_traj = bicycle_model(control, ego_current_state)  # [batch, 12, 4]
+    
+    # Posiciones predichas
+    pos_pred = ego_traj[:, :, :2]  # [batch, 12, 2]
+    
+    # Posiciones ground truth
+    pos_gt = gt_trajectory[:, :, :2]  # [batch, 12, 2]
+    
+    # Error de seguimiento (muestreamos cada 2 timesteps para reducir dimensión)
+    traj_error_x = pos_pred[:, ::2, 0] - pos_gt[:, ::2, 0]  # [batch, 6]
+    traj_error_y = pos_pred[:, ::2, 1] - pos_gt[:, ::2, 1]  # [batch, 6]
+    
+    # Concatenar errores x e y
+    traj_error = torch.cat([traj_error_x, traj_error_y], dim=-1)  # [batch, 12]
+    
+    # Escalar para evitar gradientes explosivos
+    traj_error = traj_error * 0.1
+    
+    return traj_error
+
 
 def speed(optim_vars, aux_vars):
     control = optim_vars[0].tensor.reshape(-1, 12, 2)
@@ -194,32 +333,150 @@ def safety(optim_vars, aux_vars):
 
     return safe_error
 
-def cost_function(objective, control_variables, current_state, predictions, ref_line, cost_function_weights, trajectory_len, vectorize=True):
-    # travel efficiency (COMENTADO - depende del mapa para límites de velocidad)
-    # speed_cost = th.AutoDiffCostFunction([control_variables], speed, trajectory_len, cost_function_weights[0], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="speed")
-    # objective.add(speed_cost)
-
-    # comfort
-    acc_cost = th.AutoDiffCostFunction([control_variables], acceleration, trajectory_len, cost_function_weights[1], autograd_vectorize=vectorize, name="acceleration")
+def cost_function(objective, control_variables, current_state, predictions, gt_trajectory, cost_function_weights, trajectory_len, vectorize=True):
+    """
+    Combina todas las funciones de costo con sus pesos.
+    
+    Mapeo de pesos (todos los 9 pesos deben estar asociados):
+    - weight[0]: acceleration_aux (duplicado para usar este peso)
+    - weight[1]: acceleration
+    - weight[2]: jerk  
+    - weight[3]: steering
+    - weight[4]: steering_change
+    - weight[5]: collision_avoidance (NUEVO)
+    - weight[6]: goal_reaching (NUEVO)
+    - weight[7]: trajectory_following (NUEVO)
+    - weight[8]: goal_reaching_aux (duplicado para usar este peso)
+    """
+    
+    # ========== COMFORT COSTS (suavidad del movimiento) ==========
+    
+    # Penaliza aceleraciones altas (peso principal)
+    acc_cost = th.AutoDiffCostFunction(
+        [control_variables], 
+        acceleration, 
+        trajectory_len, 
+        cost_function_weights[1], 
+        autograd_vectorize=vectorize, 
+        name="acceleration"
+    )
     objective.add(acc_cost)
-    jerk_cost = th.AutoDiffCostFunction([control_variables], jerk, trajectory_len-1, cost_function_weights[2], autograd_vectorize=vectorize, name="jerk")
+    
+    # Peso 0: usar para acceleration también (para evitar warning)
+    acc_cost_0 = th.AutoDiffCostFunction(
+        [control_variables], 
+        acceleration, 
+        trajectory_len, 
+        cost_function_weights[0],  # Asocia weight[0]
+        autograd_vectorize=vectorize, 
+        name="acceleration_aux"
+    )
+    objective.add(acc_cost_0)
+    
+    # Penaliza cambios bruscos de aceleración (jerk)
+    jerk_cost = th.AutoDiffCostFunction(
+        [control_variables], 
+        jerk, 
+        trajectory_len-1, 
+        cost_function_weights[2], 
+        autograd_vectorize=vectorize, 
+        name="jerk"
+    )
     objective.add(jerk_cost)
-    steering_cost = th.AutoDiffCostFunction([control_variables], steering, trajectory_len, cost_function_weights[3], autograd_vectorize=vectorize, name="steering")
+    
+    # Penaliza ángulos de dirección grandes
+    steering_cost = th.AutoDiffCostFunction(
+        [control_variables], 
+        steering, 
+        trajectory_len, 
+        cost_function_weights[3], 
+        autograd_vectorize=vectorize, 
+        name="steering"
+    )
     objective.add(steering_cost)
-    steering_change_cost = th.AutoDiffCostFunction([control_variables], steering_change, trajectory_len-1, cost_function_weights[4], autograd_vectorize=vectorize, name="steering_change")
+    
+    # Penaliza cambios bruscos de dirección
+    steering_change_cost = th.AutoDiffCostFunction(
+        [control_variables], 
+        steering_change, 
+        trajectory_len-1, 
+        cost_function_weights[4], 
+        autograd_vectorize=vectorize, 
+        name="steering_change"
+    )
     objective.add(steering_change_cost)
     
-    # lane (COMENTADO - depende del mapa)
+    # ========== SAFETY COSTS (evitar colisiones) ==========
+    
+    # Penaliza cercanía a otros peatones
+    collision_cost = th.AutoDiffCostFunction(
+        [control_variables], 
+        collision_avoidance, 
+        trajectory_len,  # 12 valores de error (uno por timestep)
+        cost_function_weights[5], 
+        aux_vars=[predictions, current_state], 
+        autograd_vectorize=vectorize, 
+        name="collision_avoidance"
+    )
+    objective.add(collision_cost)
+    
+    # ========== GOAL COSTS (alcanzar destino) ==========
+    
+    # Penaliza distancia a la meta final
+    goal_cost = th.AutoDiffCostFunction(
+        [control_variables], 
+        goal_reaching, 
+        2,  # 2 valores: error en x, error en y
+        cost_function_weights[6], 
+        aux_vars=[gt_trajectory, current_state], 
+        autograd_vectorize=vectorize, 
+        name="goal_reaching"
+    )
+    objective.add(goal_cost)
+    
+    # ========== TRAJECTORY FOLLOWING COSTS (seguir GT) ==========
+    
+    # Penaliza desviación de la trayectoria ground truth
+    traj_follow_cost = th.AutoDiffCostFunction(
+        [control_variables], 
+        trajectory_following, 
+        12,  # 12 valores: 6 errores en x + 6 errores en y (muestreados cada 2 timesteps)
+        cost_function_weights[7], 
+        aux_vars=[gt_trajectory, current_state], 
+        autograd_vectorize=vectorize, 
+        name="trajectory_following"
+    )
+    objective.add(traj_follow_cost)
+    
+    # Peso 8: usar para goal_reaching también (para evitar warning)
+    goal_cost_8 = th.AutoDiffCostFunction(
+        [control_variables], 
+        goal_reaching, 
+        2,
+        cost_function_weights[8],  # Asocia weight[8]
+        aux_vars=[gt_trajectory, current_state], 
+        autograd_vectorize=vectorize, 
+        name="goal_reaching_aux"
+    )
+    objective.add(goal_cost_8)
+    
+    # ========== LEGACY COSTS (comentados, dependen del mapa) ==========
+    
+    # travel efficiency (depende del mapa para límites de velocidad)
+    # speed_cost = th.AutoDiffCostFunction([control_variables], speed, trajectory_len, cost_function_weights[0], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="speed")
+    # objective.add(speed_cost)
+    
+    # lane following (depende del mapa para carriles)
     # lane_xy_cost = th.AutoDiffCostFunction([control_variables], lane_xy, trajectory_len, cost_function_weights[5], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="lane_xy")
     # objective.add(lane_xy_cost)
     # lane_theta_cost = th.AutoDiffCostFunction([control_variables], lane_theta, trajectory_len//2, cost_function_weights[6], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="lane_theta")
     # objective.add(lane_theta_cost)
 
-    # traffic rules (COMENTADO - depende del mapa para semáforos)
+    # traffic rules (depende del mapa para semáforos)
     # red_light_cost = th.AutoDiffCostFunction([control_variables], red_light_violation, trajectory_len, cost_function_weights[7], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="red_light")
     # objective.add(red_light_cost)
     
-    # safety (COMENTADO - depende del mapa para sistema de coordenadas Frenet)
+    # safety with Frenet (depende del mapa para sistema de coordenadas Frenet)
     # safety_cost = th.AutoDiffCostFunction([control_variables], safety, 10, cost_function_weights[8], aux_vars=[predictions, current_state, ref_line], autograd_vectorize=vectorize, name="safety")
     # objective.add(safety_cost)
 

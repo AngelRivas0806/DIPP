@@ -10,11 +10,9 @@ import subprocess
 from torch import nn, optim
 from utils.train_utils import *
 from model.planner import MotionPlanner
-from model.predictor import Predictor
+from model.predictor import Predictor, NUM_MODES
 from torch.utils.data import DataLoader
 
-"""python train.py --name pedestrian_NO_planning --batch_size 4 --train_set processed_data_test --valid_set processed_data_test --train_epochs 50 --learning_rate 0.0001"""
-"""python train.py --name pedestrian_WITH_planning --batch_size 4 --use_planning --train_set processed_data_test --valid_set processed_data_test --train_epochs 50 --learning_rate 0.00005"""
 
 def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
     epoch_loss = []
@@ -30,7 +28,7 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
         neighbors = batch[1].to(args.device)
         ground_truth = batch[2].to(args.device)
         
-        # ========== AGREGAR PRINTS (solo primer batch) ==========
+        # ========================================================
         if batch_idx == 0:
             print(f"\n=== Tensor Shapes en GPU ===")
             print(f"ego.shape: {ego.shape}")
@@ -45,22 +43,35 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
         # predict
         optimizer.zero_grad()
         plans, predictions, scores, cost_function_weights = predictor(ego, neighbors)
+        if batch_idx == 0:
+            # .detach() desconecta del grafo de gradientes para no romper nada
+            # .cpu() lo baja de la tarjeta gráfica
+            # .numpy() lo convierte a formato legible
+            weights_to_print = cost_function_weights[0].detach().cpu().numpy()
+            
+            # Formateamos para que se vea bonito y no con notación científica fea
+            np.set_printoptions(precision=4, suppress=True)
+            
+            print(f"\n{'='*50}")
+            print(f"INSPECCIÓN DE PESOS PARA VER SI SE ESTAN APRENDIENDO (Inicio de la Época)")
+            print(f"Cost Weights: {weights_to_print}")
+            print(f"{'='*50}\n")
 
-        plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(3)], dim=1)
+        plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(NUM_MODES)], dim=1)
         loss = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights)
         
         # plan
         if use_planning:
             plan, prediction = select_future(plans, predictions, scores)
             
-            # Create dummy ref_line_info for pedestrian (not using map) - shape: [batch, 1200, 5]
-            ref_line_info = torch.zeros(ego.shape[0], 1200, 5).to(args.device)
+            # Ground truth trajectory for trajectory following cost - shape: [batch, 12, 3]
+            gt_trajectory = ground_truth[:, 0, :, :3]  # ego's ground truth future
 
             planner_inputs = {
                 "control_variables": plan.view(ego.shape[0], 24),
                 "predictions": prediction,
-                "ref_line_info": ref_line_info,
-                "current_state": current_state
+                "current_state": current_state,
+                "gt_trajectory": gt_trajectory
             }
 
             for i in range(cost_function_weights.shape[1]):
@@ -99,7 +110,7 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
     predictorADE, predictorFDE = np.mean(epoch_metrics[:, 2]), np.mean(epoch_metrics[:, 3])
     epoch_metrics = [plannerADE, plannerFDE, predictorADE, predictorFDE]
     logging.info(f'\nplannerADE: {plannerADE:.4f}, plannerFDE: {plannerFDE:.4f}, predictorADE: {predictorADE:.4f}, predictorFDE: {predictorFDE:.4f}')
-        
+  
     return np.mean(epoch_loss), epoch_metrics
 
 def valid_epoch(data_loader, predictor, planner, use_planning):
@@ -125,21 +136,21 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
         with torch.no_grad():
             # plans, predictions, scores, cost_function_weights = predictor(ego, neighbors, map_lanes, map_crosswalks)
             plans, predictions, scores, cost_function_weights = predictor(ego, neighbors)
-            plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(3)], dim=1)
+            plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(NUM_MODES)], dim=1)
             loss = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights) # multi-future multi-agent loss
-
+            
         # plan 
         if use_planning:
             plan, prediction = select_future(plans, predictions, scores)
             
-            # Create dummy ref_line_info for pedestrian (not using map) - shape: [batch, 1200, 5]
-            ref_line_info = torch.zeros(ego.shape[0], 1200, 5).to(args.device)
+            # Ground truth trajectory for trajectory following cost - shape: [batch, 12, 3]
+            gt_trajectory = ground_truth[:, 0, :, :3]  # ego's ground truth future
 
             planner_inputs = {
-                "control_variables": plan.view(ego.shape[0], 24), # generate initial control sequence (12*2)
-                "predictions": prediction, # generate predictions for surrounding vehicles 
-                "ref_line_info": ref_line_info,
-                "current_state": current_state
+                "control_variables": plan.view(ego.shape[0], 24),
+                "predictions": prediction,
+                "current_state": current_state,
+                "gt_trajectory": gt_trajectory
             }
 
             for i in range(cost_function_weights.shape[1]):
@@ -168,7 +179,7 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
         current += batch[0].shape[0]
         sys.stdout.write(f"\rValid Progress: [{current:>6d}/{size:>6d}]  Loss: {np.mean(epoch_loss):>.4f}  {(time.time()-start_time)/current:>.4f}s/sample")
         sys.stdout.flush()
-
+ 
     epoch_metrics = np.array(epoch_metrics)
     plannerADE, plannerFDE = np.mean(epoch_metrics[:, 0]), np.mean(epoch_metrics[:, 1])
     predictorADE, predictorFDE = np.mean(epoch_metrics[:, 2]), np.mean(epoch_metrics[:, 3])
@@ -204,7 +215,7 @@ def model_training():
     
     # set up optimizer
     optimizer = optim.Adam(predictor.parameters(), lr=args.learning_rate)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=4, gamma=0.5)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
 
     # training parameters
     train_epochs = args.train_epochs
@@ -269,15 +280,15 @@ def model_training():
             check=True
         )
 
-        logging.info(f"   Graphs saved in: training_log/{args.name}/")
+        logging.info(f"Graphs saved in: training_log/{args.name}/")
         if result.stdout:
             logging.info(result.stdout)
     except subprocess.CalledProcessError as e:
-        logging.warning(f"⚠️  Error al generar gráficas: {e}")
+        logging.warning(f"Error al generar gráficas: {e}")
         if e.stderr:
             logging.warning(e.stderr)
     except FileNotFoundError:
-        logging.warning("⚠️  No se encontró plot_training.py")
+        logging.warning("No se encontró plot_training.py")
     
     logging.info("="*60)
     logging.info("ENTRENAMIENTO COMPLETADO")
