@@ -38,7 +38,7 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
         # ========================================================
         
         current_state = torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
-        weights = torch.ne(ground_truth[:, 1:, :, :3], 0)
+        weights = torch.ne(ground_truth[:, 1:, :, :2], 0)
 
         # predict
         optimizer.zero_grad()
@@ -130,7 +130,7 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
         # ref_line_info = batch[4].to(args.device)
         ground_truth = batch[2].to(args.device)
         current_state = torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
-        weights = torch.ne(ground_truth[:, 1:, :, :3], 0)
+        weights = torch.ne(ground_truth[:, 1:, :, :2], 0)
 
         # predict
         with torch.no_grad():
@@ -215,7 +215,7 @@ def model_training():
     
     # set up optimizer
     optimizer = optim.Adam(predictor.parameters(), lr=args.learning_rate)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=1)
 
     # training parameters
     train_epochs = args.train_epochs
@@ -302,7 +302,7 @@ if __name__ == "__main__":
     parser.add_argument('--valid_set', type=str, help='path to validation datasets')
     parser.add_argument('--seed', type=int, help='fix random seed', default=42)
     parser.add_argument("--num_workers", type=int, default=8, help="number of workers used for dataloader")
-    parser.add_argument('--pretrain_epochs', type=int, help='epochs of pretraining predictor', default=5)
+    parser.add_argument('--pretrain_epochs', type=int, help='epochs of pretraining predictor', default=7)
     parser.add_argument('--train_epochs', type=int, help='epochs of training', default=20)
     parser.add_argument('--batch_size', type=int, help='batch size (default: 32)', default=32)
     parser.add_argument('--learning_rate', type=float, help='learning rate (default: 2e-4)', default=2e-4)

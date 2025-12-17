@@ -82,54 +82,88 @@ class DrivingData(Dataset):
         # map_crosswalks = data['map_crosswalks']
 
         # ========== NORMALIZACIÓN AL SISTEMA DE REFERENCIA DEL EGO ==========
-        # Obtener posición y orientación actual del ego (último frame observado)
+        # ========== NORMALIZACIÓN AL SISTEMA DE REFERENCIA DEL EGO ==========
+        # En process_eth_ucy.py el formato es: [x, y, vx, vy, ax, ay, 0, 0]
+        # Por lo tanto, no tenemos theta explícito, debemos calcularlo.
+        
+        # Obtener velocidades del último frame
+        vx_end = ego[-1, 2]
+        vy_end = ego[-1, 3]
+        
+        # Calcular heading actual
+        if np.abs(vx_end) < 1e-2 and np.abs(vy_end) < 1e-2:
+            ego_current_heading = 0.0 # Si está quieto, asume 0
+        else:
+            ego_current_heading = np.arctan2(vy_end, vx_end)
+            
         ego_current_pos = ego[-1, :2].copy()  # (x, y)
-        ego_current_heading = ego[-1, 2].copy()  # theta
         
         cos_h = np.cos(-ego_current_heading)
         sin_h = np.sin(-ego_current_heading)
         
         # 1. Normalizar ego
         ego[:, :2] = ego[:, :2] - ego_current_pos  # trasladar
-        # Rotar posiciones
+        
+        # Rotar posiciones (x, y) -> indices 0, 1
         x_rot = ego[:, 0] * cos_h - ego[:, 1] * sin_h
         y_rot = ego[:, 0] * sin_h + ego[:, 1] * cos_h
         ego[:, 0] = x_rot
         ego[:, 1] = y_rot
-        # Rotar heading
-        ego[:, 2] = ego[:, 2] - ego_current_heading
-        # Rotar velocidades si existen
-        if ego.shape[1] > 4:
-            vx_rot = ego[:, 3] * cos_h - ego[:, 4] * sin_h
-            vy_rot = ego[:, 3] * sin_h + ego[:, 4] * cos_h
-            ego[:, 3] = vx_rot
-            ego[:, 4] = vy_rot
         
+        # Rotar velocidades (vx, vy) -> indices 2, 3
+        vx_rot = ego[:, 2] * cos_h - ego[:, 3] * sin_h
+        vy_rot = ego[:, 2] * sin_h + ego[:, 3] * cos_h
+        ego[:, 2] = vx_rot
+        ego[:, 3] = vy_rot
+        
+        # Rotar aceleraciones (ax, ay) -> indices 4, 5
+        ax_rot = ego[:, 4] * cos_h - ego[:, 5] * sin_h
+        ay_rot = ego[:, 4] * sin_h + ego[:, 5] * cos_h
+        ego[:, 4] = ax_rot
+        ego[:, 5] = ay_rot
+
         # 2. Normalizar vecinos
         for i in range(neighbors.shape[0]):
-            if neighbors[i, -1, 0] != 0:  # si el vecino existe
+            if neighbors[i, -1, 8] != 0:  # si el vecino existe (flag en idx 8)
                 neighbors[i, :, :2] = neighbors[i, :, :2] - ego_current_pos
+                
+                # Rotar pos
                 x_rot = neighbors[i, :, 0] * cos_h - neighbors[i, :, 1] * sin_h
                 y_rot = neighbors[i, :, 0] * sin_h + neighbors[i, :, 1] * cos_h
                 neighbors[i, :, 0] = x_rot
                 neighbors[i, :, 1] = y_rot
-                neighbors[i, :, 2] = neighbors[i, :, 2] - ego_current_heading
-                if neighbors.shape[2] > 4:
-                    vx_rot = neighbors[i, :, 3] * cos_h - neighbors[i, :, 4] * sin_h
-                    vy_rot = neighbors[i, :, 3] * sin_h + neighbors[i, :, 4] * cos_h
-                    neighbors[i, :, 3] = vx_rot
-                    neighbors[i, :, 4] = vy_rot
+                
+                # Rotar vel
+                vx_rot = neighbors[i, :, 2] * cos_h - neighbors[i, :, 3] * sin_h
+                vy_rot = neighbors[i, :, 2] * sin_h + neighbors[i, :, 3] * cos_h
+                neighbors[i, :, 2] = vx_rot
+                neighbors[i, :, 3] = vy_rot
+                
+                 # Rotar acc
+                ax_rot = neighbors[i, :, 4] * cos_h - neighbors[i, :, 5] * sin_h
+                ay_rot = neighbors[i, :, 4] * sin_h + neighbors[i, :, 5] * cos_h
+                neighbors[i, :, 4] = ax_rot
+                neighbors[i, :, 5] = ay_rot
+
         
         # 3. Normalizar ground truth
         for i in range(gt_future_states.shape[0]):
-            if np.any(gt_future_states[i] != 0):
+            # Verificar si la trayectoria es válida (no todo ceros)
+            if np.abs(gt_future_states[i]).sum() > 0.001:
                 gt_future_states[i, :, :2] = gt_future_states[i, :, :2] - ego_current_pos
+                
+                # Rotar pos
                 x_rot = gt_future_states[i, :, 0] * cos_h - gt_future_states[i, :, 1] * sin_h
                 y_rot = gt_future_states[i, :, 0] * sin_h + gt_future_states[i, :, 1] * cos_h
                 gt_future_states[i, :, 0] = x_rot
                 gt_future_states[i, :, 1] = y_rot
+                
+                # Rotar vel (si existen en GT)
                 if gt_future_states.shape[2] > 2:
-                    gt_future_states[i, :, 2] = gt_future_states[i, :, 2] - ego_current_heading
+                    vx_rot = gt_future_states[i, :, 2] * cos_h - gt_future_states[i, :, 3] * sin_h
+                    vy_rot = gt_future_states[i, :, 2] * sin_h + gt_future_states[i, :, 3] * cos_h
+                    gt_future_states[i, :, 2] = vx_rot
+                    gt_future_states[i, :, 3] = vy_rot
         # ========== FIN NORMALIZACIÓN ==========
         
         # Pad or truncate gt_future_states to 12 frames
@@ -148,6 +182,9 @@ def MFMA_loss(plans, predictions, scores, ground_truth, weights):
 
     predictions = predictions * weights.unsqueeze(1)
     # Cambiar 9::10 a usar más frames para 12 timesteps (usar frames 5 y 11)
+    # predictions has shape [B, modes, neighbors, T, 2]
+    # ground_truth has shape [B, agents, T, 8] -> we need agents 1 to N, and features :2 (x,y)
+    
     prediction_distance = torch.norm(predictions[:, :, :, [5, 11], :2] - ground_truth[:, None, 1:, [5, 11], :2], dim=-1)
     plan_distance = torch.norm(plans[:, :, [5, 11], :2] - ground_truth[:, None, 0, [5, 11], :2], dim=-1)
     prediction_distance = prediction_distance.mean(-1).sum(-1)
@@ -157,12 +194,32 @@ def MFMA_loss(plans, predictions, scores, ground_truth, weights):
     score_loss = F.cross_entropy(scores, best_mode)
     best_mode_plan = torch.stack([plans[i, m] for i, m in enumerate(best_mode)])
     best_mode_prediction = torch.stack([predictions[i, m] for i, m in enumerate(best_mode)])
-    prediction = torch.cat([best_mode_plan.unsqueeze(1), best_mode_prediction], dim=1)
+    
+    # Pad neighbor predictions with a dummy theta (0) to match ego plan's 3D shape [x, y, theta]
+    # best_mode_prediction: [B, neighbors, T, 2] -> [B, neighbors, T, 3]
+    dummy_theta = torch.zeros_like(best_mode_prediction[:, :, :, :1])
+    best_mode_prediction_3d = torch.cat([best_mode_prediction, dummy_theta], dim=-1)
+    
+    # Now execute concatenation with matching shapes
+    prediction = torch.cat([best_mode_plan.unsqueeze(1), best_mode_prediction_3d], dim=1)
 
     prediction_loss: torch.tensor = 0
+    # Loop over all agents (0=ego, 1..N=neighbors)
     for i in range(prediction.shape[1]):
-        prediction_loss += F.smooth_l1_loss(prediction[:, i], ground_truth[:, i, :, :3])
-        prediction_loss += F.smooth_l1_loss(prediction[:, i, -1], ground_truth[:, i, -1, :3])
+        if i == 0:
+             # Ego plan has 3 dims (x, y, theta) or 9 dims from planner? 
+             # bicycle_model outputs 4 dims: x,y,theta,v. We slice :3 in train.py usually.
+             # Wait, prediction[0] comes from 'plans' which comes from bicycle_model in train.py (line 60, 139) -> [x, y, theta]
+             # But prediction[1:] comes from 'predictions' (AgentDecoder) -> [x, y]
+             
+             # So for ego (i=0), we compare x,y,theta? Or just x,y?
+             # Let's compare all 3 for ego since planner produces them.
+             prediction_loss += F.smooth_l1_loss(prediction[:, i, :, :3], ground_truth[:, i, :, :3])
+             prediction_loss += F.smooth_l1_loss(prediction[:, i, -1, :3], ground_truth[:, i, -1, :3])
+        else:
+             # For neighbors (i>0), we only have [x, y]
+             prediction_loss += F.smooth_l1_loss(prediction[:, i, :, :2], ground_truth[:, i, :, :2])
+             prediction_loss += F.smooth_l1_loss(prediction[:, i, -1, :2], ground_truth[:, i, -1, :2])
         
     return 0.5 * prediction_loss + score_loss
 
@@ -190,7 +247,10 @@ def select_future(plans, predictions, scores):
 
 def motion_metrics(plan_trajectory, prediction_trajectories, ground_truth_trajectories, weights):
     prediction_trajectories = prediction_trajectories * weights
+    # Plan is 3D (x,y,theta), GT is 3D+... compare positions :2
     plan_distance = torch.norm(plan_trajectory[:, :, :2] - ground_truth_trajectories[:, 0, :, :2], dim=-1)
+    
+    # Prediction is 2D (x,y), GT is 3D+... compare positions :2
     prediction_distance = torch.norm(prediction_trajectories[:, :, :, :2] - ground_truth_trajectories[:, 1:, :, :2], dim=-1)
 
     # planning

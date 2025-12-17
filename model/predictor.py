@@ -172,28 +172,30 @@ class AgentDecoder(nn.Module):
         self._future_steps = future_steps 
         self._num_neighbors = num_neighbors
         self._num_modes = num_modes
-        self.decode = nn.Sequential(nn.Dropout(0.1), nn.Linear(256, 256), nn.ELU(), nn.Linear(256, future_steps*3))
+        # Output only 2 values (delta_x, delta_y) per step
+        self.decode = nn.Sequential(nn.Dropout(0.1), nn.Linear(256, 256), nn.ELU(), nn.Linear(256, future_steps*2))
 
     def transform(self, prediction, current_state):
         x = current_state[:, 0] 
         y = current_state[:, 1]
-        theta = current_state[:, 2]
+        # Ignore theta/velocity from input, we only predict position
+        
         delta_x = prediction[:, :, 0]
         delta_y = prediction[:, :, 1]
-        delta_theta = prediction[:, :, 2]
+        
         new_x = x.unsqueeze(1) + delta_x 
         new_y = y.unsqueeze(1) + delta_y 
-        new_theta = theta.unsqueeze(1) + delta_theta
-        traj = torch.stack([new_x, new_y, new_theta], dim=-1)
+        
+        # Output: [x, y]
+        traj = torch.stack([new_x, new_y], dim=-1)
 
         return traj
        
     def forward(self, agent_agent, current_state):
-        decoded = self.decode(agent_agent).view(-1, self._num_modes, self._num_neighbors, self._future_steps, 3)
+        # View as [..., future_steps, 2] instead of 3
+        decoded = self.decode(agent_agent).view(-1, self._num_modes, self._num_neighbors, self._future_steps, 2)
         trajs = torch.stack([self.transform(decoded[:, i, j], current_state[:, j]) for i in range(self._num_modes) for j in range(self._num_neighbors)], dim=1)
-        trajs = torch.reshape(trajs, (-1, self._num_modes, self._num_neighbors, self._future_steps, 3))
-
-        return trajs
+        trajs = torch.reshape(trajs, (-1, self._num_modes, self._num_neighbors, self._future_steps, 2))
 
         return trajs
 
@@ -220,27 +222,45 @@ class AVDecoder(nn.Module):
         super(AVDecoder, self).__init__()
         self._future_steps = future_steps
         self._num_modes = num_modes
-        # Output control variables (acceleration and steering) instead of trajectories
+        # Output control variables (acceleration and direction change) instead of trajectories
         self.control = nn.Sequential(
             nn.Dropout(0.1),
             nn.Linear(256, 256),
             nn.ELU(),
             nn.Linear(256, future_steps*2)
         )
+        
+        # All 9 cost weights are now learnable
         self.cost_weights = nn.Parameter(torch.ones(feature_len, dtype=torch.float32))
-        self.register_buffer('scale', torch.tensor([1, 1, 1, 1, 1, 10, 100], dtype=torch.float32))
-        self.register_buffer('constraint', torch.tensor([[10, 10]], dtype=torch.float32))
+        
+        # Scales adapted for PEDESTRIANS:
+        # [acc_aux, acc, jerk, steering, steer_change, collision, traj1, traj2, traj3]
+        # - Comfort costs (0-4): low scale, pedestrians are agile
+        # - Collision (5): high scale, safety is critical
+        # - Trajectory following (6-8): medium scale, main learning objective
+        self.register_buffer('scale', torch.tensor([
+            0.5,   # weight[0]: acceleration_aux (bajo)
+            0.5,   # weight[1]: acceleration (bajo)
+            0.1,   # weight[2]: jerk (muy bajo - peatones cambian rápido)
+            0.1,   # weight[3]: steering (bajo - no aplica a peatones)
+            0.1,   # weight[4]: steering_change (bajo)
+            5.0,   # weight[5]: collision_avoidance (ALTO - seguridad)
+            2.0,   # weight[6]: trajectory_following_aux1
+            2.0,   # weight[7]: trajectory_following
+            2.0,   # weight[8]: trajectory_following_aux2
+        ], dtype=torch.float32))
 
     def forward(self, agent_agent, current_state):
         # Generate control variables for num_modes modes
         actions = self.control(agent_agent).view(-1, self._num_modes, self._future_steps, 2)
 
-        # Generate cost function weights (global, learnable)
-        norm_weights = torch.softmax(self.cost_weights, dim=0)  # (feature_len,)
-        scaled_weights = norm_weights[:7] * self.scale  # (7,)
-        cost_function_weights = torch.cat([scaled_weights, self.constraint[0]], dim=-1)  # (9,)
+        # Generate cost function weights (all learnable, scaled for pedestrians)
+        norm_weights = torch.softmax(self.cost_weights, dim=0)  # (9,)
+        scaled_weights = norm_weights * self.scale  # (9,) - all 9 weights are now scaled
+        
         # Expand to batch dimension for compatibility
-        cost_function_weights = cost_function_weights.unsqueeze(0).expand(actions.shape[0], -1)  # (B, 9)
+        cost_function_weights = scaled_weights.unsqueeze(0).expand(actions.shape[0], -1)  # (B, 9)
+
 
         return actions, cost_function_weights
 
