@@ -35,37 +35,7 @@ class MotionPlanner:
         self.layer = th.TheseusLayer(self.optimizer, vectorize=False)
         self.layer.to(device=device)
 
-# model
-# def bicycle_model(control, current_state):
-#     dt = 0.1 # discrete time period [s]
-#     max_a = 5 # vehicle's accleration limits [m/s^2]
-#     max_d = 0.5 # vehicle's steering limits [rad]
-#     L = 3.089 # vehicle's wheelbase [m]
-    
-#     x_0 = current_state[:, 0] # vehicle's x-coordinate [m]
-#     y_0 = current_state[:, 1] # vehicle's y-coordinate [m]
-#     theta_0 = current_state[:, 2] # vehicle's heading [rad]
-#     v_0 = torch.hypot(current_state[:, 3], current_state[:, 4]) # vehicle's velocity [m/s]
-#     a = control[:, :, 0].clamp(-max_a, max_a) # vehicle's accleration [m/s^2]
-#     delta = control[:, :, 1].clamp(-max_d, max_d) # vehicle's steering [rad]
 
-#     # speed
-#     v = v_0.unsqueeze(1) + torch.cumsum(a * dt, dim=1)
-#     v = torch.clamp(v, min=0)
-
-#     # angle
-#     d_theta = v * delta / L # use delta to approximate tan(delta)
-#     theta = theta_0.unsqueeze(1) + torch.cumsum(d_theta * dt, dim=-1)
-#     theta = torch.fmod(theta, 2*torch.pi)
-    
-#     # x and y coordniate
-#     x = x_0.unsqueeze(1) + torch.cumsum(v * torch.cos(theta) * dt, dim=-1)
-#     y = y_0.unsqueeze(1) + torch.cumsum(v * torch.sin(theta) * dt, dim=-1)
-    
-#     # output trajectory
-#     traj = torch.stack([x, y, theta, v], dim=-1)
-
-#     return traj
 
 # cost functions
 def acceleration(optim_vars, aux_vars):
@@ -96,10 +66,6 @@ def steering_change(optim_vars, aux_vars):
 
     return steering_change
 
-
-# ============================================================================
-# NEW COST FUNCTIONS FOR PEDESTRIAN TRAJECTORY PLANNING
-# ============================================================================
 
 def collision_avoidance(optim_vars, aux_vars):
     """
@@ -249,51 +215,6 @@ def speed(optim_vars, aux_vars):
 
     return speed_error
 
-# def lane_xy(optim_vars, aux_vars):
-#     control = optim_vars[0].tensor.reshape(-1, 12, 2)
-#     ref_line = aux_vars[0].tensor
-#     current_state = aux_vars[1].tensor[:, 0]
-    
-#     traj = bicycle_model(control, current_state)
-#     distance_to_ref = torch.cdist(traj[:, :, :2], ref_line[:, :, :2])
-#     k = torch.argmin(distance_to_ref, dim=-1).view(-1, traj.shape[1], 1).expand(-1, -1, 3)
-#     ref_points = torch.gather(ref_line, 1, k)
-#     lane_error = torch.cat([traj[:, 1::2, 0]-ref_points[:, 1::2, 0], traj[:, 1::2, 1]-ref_points[:, 1::2, 1]], dim=1)
-
-#     return lane_error
-
-# def lane_theta(optim_vars, aux_vars):
-#     control = optim_vars[0].tensor.reshape(-1, 12, 2)
-#     ref_line = aux_vars[0].tensor
-#     current_state = aux_vars[1].tensor[:, 0]
-
-#     traj = bicycle_model(control, current_state)
-#     distance_to_ref = torch.cdist(traj[:, :, :2], ref_line[:, :, :2])
-#     k = torch.argmin(distance_to_ref, dim=-1).view(-1, traj.shape[1], 1).expand(-1, -1, 3)
-#     ref_points = torch.gather(ref_line, 1, k)
-#     theta = traj[:, :, 2]
-#     lane_error = theta[:, 1::2] - ref_points[:, 1::2, 2]
-    
-#     return lane_error
-
-# def red_light_violation(optim_vars, aux_vars):
-#     control = optim_vars[0].tensor.reshape(-1, 12, 2)
-#     current_state = aux_vars[1].tensor[:, 0]
-#     ref_line = aux_vars[0].tensor
-#     red_light = ref_line[..., -1]
-#     dt = 0.1
-
-#     velocity = torch.hypot(current_state[:, 3], current_state[:, 4]) 
-#     acc = control[:, :, 0]
-#     speed = velocity.unsqueeze(1) + torch.cumsum(acc * dt, dim=1)
-#     speed = torch.clamp(speed, min=0)
-#     s = torch.cumsum(speed * dt, dim=-1)
-
-#     stop_point = torch.max(red_light[:, 200:]==0, dim=-1)[1] * 0.1
-#     stop_distance = stop_point.view(-1, 1) - 3
-#     red_light_error = (s - stop_distance) * (s > stop_distance) * (stop_point.unsqueeze(-1) != 0)
-
-#     return red_light_error
 
 def safety(optim_vars, aux_vars):
     control = optim_vars[0].tensor.reshape(-1, 12, 2)
@@ -338,15 +259,15 @@ def cost_function(objective, control_variables, current_state, predictions, gt_t
     Combina todas las funciones de costo con sus pesos.
     
     Mapeo de pesos (todos los 9 pesos deben estar asociados):
-    - weight[0]: acceleration_aux (duplicado para usar este peso)
+    - weight[0]: acceleration_aux 
     - weight[1]: acceleration
     - weight[2]: jerk  
     - weight[3]: steering
     - weight[4]: steering_change
-    - weight[5]: collision_avoidance (NUEVO)
-    - weight[6]: trajectory_following (REEMPLAZA goal_reaching)
-    - weight[7]: trajectory_following (NUEVO)
-    - weight[8]: trajectory_following (REEMPLAZA goal_reaching_aux)
+    - weight[5]: collision_avoidance 
+    - weight[6]: trajectory_following 
+    - weight[7]: trajectory_following 
+    - weight[8]: trajectory_following 
     """
     
     # ========== COMFORT COSTS (suavidad del movimiento) ==========
@@ -459,25 +380,5 @@ def cost_function(objective, control_variables, current_state, predictions, gt_t
         name="trajectory_following_aux2"
     )
     objective.add(traj_follow_cost_8)
-    
-    # ========== LEGACY COSTS =======================
-    
-    # travel efficiency (depende del mapa para límites de velocidad)
-    # speed_cost = th.AutoDiffCostFunction([control_variables], speed, trajectory_len, cost_function_weights[0], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="speed")
-    # objective.add(speed_cost)
-    
-    # lane following (depende del mapa para carriles)
-    # lane_xy_cost = th.AutoDiffCostFunction([control_variables], lane_xy, trajectory_len, cost_function_weights[5], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="lane_xy")
-    # objective.add(lane_xy_cost)
-    # lane_theta_cost = th.AutoDiffCostFunction([control_variables], lane_theta, trajectory_len//2, cost_function_weights[6], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="lane_theta")
-    # objective.add(lane_theta_cost)
-
-    # traffic rules (depende del mapa para semáforos)
-    # red_light_cost = th.AutoDiffCostFunction([control_variables], red_light_violation, trajectory_len, cost_function_weights[7], aux_vars=[ref_line, current_state], autograd_vectorize=vectorize, name="red_light")
-    # objective.add(red_light_cost)
-    
-    # safety with Frenet (depende del mapa para sistema de coordenadas Frenet)
-    # safety_cost = th.AutoDiffCostFunction([control_variables], safety, 10, cost_function_weights[8], aux_vars=[predictions, current_state, ref_line], autograd_vectorize=vectorize, name="safety")
-    # objective.add(safety_cost)
 
     return objective

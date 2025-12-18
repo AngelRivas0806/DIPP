@@ -44,12 +44,7 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
         optimizer.zero_grad()
         plans, predictions, scores, cost_function_weights = predictor(ego, neighbors)
         if batch_idx == 0:
-            # .detach() desconecta del grafo de gradientes para no romper nada
-            # .cpu() lo baja de la tarjeta gráfica
-            # .numpy() lo convierte a formato legible
             weights_to_print = cost_function_weights[0].detach().cpu().numpy()
-            
-            # Formateamos para que se vea bonito y no con notación científica fea
             np.set_printoptions(precision=4, suppress=True)
             
             print(f"\n{'='*50}")
@@ -125,9 +120,6 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
         # prepare data
         ego = batch[0].to(args.device)
         neighbors = batch[1].to(args.device)
-        # map_lanes = batch[2].to(args.device)
-        # map_crosswalks = batch[3].to(args.device)
-        # ref_line_info = batch[4].to(args.device)
         ground_truth = batch[2].to(args.device)
         current_state = torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
         weights = torch.ne(ground_truth[:, 1:, :, :2], 0)
@@ -162,7 +154,6 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
             plan = final_values["control_variables"].view(-1, 12, 2)
             plan = bicycle_model(plan, ego[:, -1])[:, :, :3]
 
-            # Usar el error del optimizador en lugar de error_squared_norm
             plan_cost = info.last_err.mean() if hasattr(info, 'last_err') else 0
             plan_loss = F.smooth_l1_loss(plan, ground_truth[:, 0, :, :3])
             plan_loss += F.smooth_l1_loss(plan[:, -1], ground_truth[:, 0, -1, :3])
@@ -266,9 +257,9 @@ def model_training():
         torch.save(predictor.state_dict(), f'training_log/{args.name}/model_{epoch+1}_{val_metrics[0]:.4f}.pth')
         logging.info(f"Model saved in training_log/{args.name}\n")
     
-    # Al finalizar el entrenamiento, generar gráficas automáticamente
+    # Generate graphs automatically
     logging.info("="*60)
-    logging.info("Generando gráficas de entrenamiento...")
+    logging.info("Generating training graphs...")
     logging.info("="*60)
     
     try:
@@ -284,7 +275,7 @@ def model_training():
         if result.stdout:
             logging.info(result.stdout)
     except subprocess.CalledProcessError as e:
-        logging.warning(f"Error al generar gráficas: {e}")
+    logging.warning(f"Error al generar gráficas: {e}")
         if e.stderr:
             logging.warning(e.stderr)
     except FileNotFoundError:
@@ -295,7 +286,7 @@ def model_training():
     logging.info("="*60)
 
 if __name__ == "__main__":
-    # Arguments
+    
     parser = argparse.ArgumentParser(description='Training')
     parser.add_argument('--name', type=str, help='log name (default: "Exp1")', default="Exp1")
     parser.add_argument('--train_set', type=str, help='path to train datasets')
@@ -310,5 +301,5 @@ if __name__ == "__main__":
     parser.add_argument('--device', type=str, help='run on which device (default: cuda)', default='cuda')
     args = parser.parse_args()
 
-    # Run
+    
     model_training()
