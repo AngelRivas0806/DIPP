@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import logging
 import glob
+import os
 from torch.utils.data import Dataset
 from torch.nn import functional as F
 
@@ -57,25 +58,59 @@ gt_future_states:
 
 class DrivingData(Dataset):
     def __init__(self, data_dir):
-        self.data_list = glob.glob(data_dir)
+        """
+        Args:
+            data_dir: Path to the consolidated .npz file (e.g., 'data/train_combined/data.npz')
+                      OR path pattern for multiple files (e.g., 'data/train_combined/*.npz')
+        """
+        # Check if it's a single .npz file or a directory pattern
+        if data_dir.endswith('.npz') and os.path.isfile(data_dir):
+            # New format: Single consolidated .npz file
+            print(f"Loading consolidated dataset from: {data_dir}")
+            data = np.load(data_dir)
+            self.ego = data['ego']
+            self.neighbors = data['neighbors']
+            self.gt_future_states = data['gt_future_states']
+            self.consolidated = True
+            print(f"  - Loaded {len(self.ego)} samples")
+        else:
+            # Old format: Multiple .npz files
+            print(f"Loading multiple files from: {data_dir}")
+            self.data_list = glob.glob(data_dir)
+            self.consolidated = False
+            print(f"  - Found {len(self.data_list)} files")
 
     def __len__(self):
-        return len(self.data_list)
+        if self.consolidated:
+            return len(self.ego)
+        else:
+            return len(self.data_list)
 
     def __getitem__(self, idx):
-        try:
-            data = np.load(self.data_list[idx])
-            ego = data['ego']
-            neighbors = data['neighbors']
-            gt_future_states = data['gt_future_states']
-        except (ValueError, TypeError, KeyError):
-            # Si hay problema con este archivo, intentar con el siguiente
-            return self.__getitem__((idx + 1) % len(self.data_list))
+        if self.consolidated:
+            # Load from pre-loaded arrays
+            ego = self.ego[idx].copy()
+            neighbors = self.neighbors[idx].copy()
+            gt_future_states = self.gt_future_states[idx].copy()
+        else:
+            # Load from individual files (old format)
+            try:
+                data = np.load(self.data_list[idx])
+                ego = data['ego']
+                neighbors = data['neighbors']
+                gt_future_states = data['gt_future_states']
+            except (ValueError, TypeError, KeyError):
+                # Si hay problema con este archivo, intentar con el siguiente
+                return self.__getitem__((idx + 1) % len(self.data_list))
         
         # ========== FILTRAR DATOS INVÁLIDOS ==========
         # Si el ego está completamente vacío (todo ceros), saltar este sample
         if np.all(ego == 0):
-            return self.__getitem__((idx + 1) % len(self.data_list))
+            if self.consolidated:
+                # En modo consolidado, retornar el siguiente índice válido
+                return self.__getitem__((idx + 1) % len(self))
+            else:
+                return self.__getitem__((idx + 1) % len(self.data_list))
         
         # ref_line = data['ref_line'] 
         # map_lanes = data['map_lanes']

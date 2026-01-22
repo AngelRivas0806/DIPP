@@ -213,8 +213,16 @@ def model_training():
     batch_size = args.batch_size
     
     # set up data loaders
-    train_set = DrivingData(args.train_set+'/*')
-    valid_set = DrivingData(args.valid_set+'/*')
+    # Check if train_set is a direct path to .npz file or a directory
+    if args.train_set.endswith('.npz'):
+        # New format: Direct path to consolidated .npz file
+        train_set = DrivingData(args.train_set)
+        valid_set = DrivingData(args.valid_set)
+    else:
+        # Old format: Directory with multiple files
+        train_set = DrivingData(args.train_set+'/*')
+        valid_set = DrivingData(args.valid_set+'/*')
+    
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=args.num_workers)
     valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False, num_workers=args.num_workers)
     logging.info("Dataset Prepared: {} train data, {} validation data\n".format(len(train_set), len(valid_set)))
@@ -275,7 +283,7 @@ def model_training():
         if result.stdout:
             logging.info(result.stdout)
     except subprocess.CalledProcessError as e:
-    logging.warning(f"Error al generar gráficas: {e}")
+        logging.warning(f"Error al generar gráficas: {e}")
         if e.stderr:
             logging.warning(e.stderr)
     except FileNotFoundError:
