@@ -1,31 +1,3 @@
-"""
-Script to process ETH/UCY datasets from CSV to .npz format
-
-
-Input format: CSV with columns [frame, ped_id, x, y] in WORLD COORDINATES (meters)
-Output format: .npz with keys [ego, neighbors, gt_future_states]
-
-=== Structure of the processed .npz file ===
-Available keys: ['ego', 'neighbors', 'gt_future_states']
-
-ego:
-  - Shape: (8, 8)
-  - Dtype: float32
-  - Min/Max: -0.0847 / 0.8875
-  - First 2 positions:
-[[ 0.8875    0.71354  -0.084725  0.      ]
- [ 0.85361   0.71354  -0.084725  0.      ]]
-
-neighbors:
-  - Shape: (10, 8, 9)
-  - Dtype: float32
-  - Min/Max: -0.0855 / 1.0000
-
-gt_future_states:
-  - Shape: (11, 12, 8)
-  - Dtype: float32
-  - Min/Max: -0.0903 / 0.9077"""
-
 import numpy as np
 import pandas as pd
 import argparse
@@ -40,7 +12,7 @@ class ETHUCYProcessor:
         """
         Args:
             obs_len: Number of observation frames (history)
-            pred_len: NNumber of prediction frames (future)
+            pred_len: Number of prediction frames (future)
             fps: Frames per second of the dataset
             num_neighbors: Maximum number of neighbors to consider
             use_ego: If True, process with ego-centric representation. If False, only positions.
@@ -49,9 +21,11 @@ class ETHUCYProcessor:
         self.pred_len = pred_len
         self.total_len = obs_len + pred_len
         self.fps = fps
-        self.dt = 1.0 / fps  # time between frames
+        self.dt = np.float32(1.0 / fps)  # time between frames
         self.num_neighbors = num_neighbors
         self.use_ego = use_ego
+        self._ped_tracks = None
+        self._frame_index = None
         
     def load_csv(self, csv_path):
         """
@@ -60,10 +34,33 @@ class ETHUCYProcessor:
         df = pd.read_csv(csv_path, header=None, names=['frame', 'ped_id', 'x', 'y'])
         return df
     
+    def _build_cache(self, df):
+        """
+        Build cache structures for fast trajectory access.
+        Creates:
+        - self._ped_tracks: dict {ped_id: (frames_array, xy_array)}
+        - self._frame_index: dict {frame: (ped_ids_array, xy_array)}
+        """
+        self._ped_tracks = {}
+        self._frame_index = {}
+        
+        # Build per-pedestrian index using groupby
+        for ped_id, g in df.groupby('ped_id', sort=False):
+            g = g.sort_values('frame')
+            frames = g['frame'].values
+            xy = g[['x', 'y']].values.astype(np.float32)
+            self._ped_tracks[ped_id] = (frames, xy)
+        
+        # Build per-frame index using groupby
+        for frame, g in df.groupby('frame', sort=False):
+            ped_ids = g['ped_id'].values
+            xy = g[['x', 'y']].values.astype(np.float32)
+            self._frame_index[int(frame)] = (ped_ids, xy)
+    
     def compute_velocity(self, positions):
         """Compute velocities from positions"""
         if len(positions) < 2:
-            return np.zeros((len(positions), 2))
+            return np.zeros((len(positions), 2), dtype=positions.dtype)
         
         velocities = np.zeros_like(positions)
         velocities[1:] = (positions[1:] - positions[:-1]) / self.dt
@@ -111,6 +108,49 @@ class ETHUCYProcessor:
 
         return traj
     
+    def get_trajectory_fast(self, ped_id, start_frame, end_frame, frame_step=10):
+        """
+        Fast version of get_trajectory using cache.
+        
+        Args:
+            ped_id: Pedestrian ID
+            start_frame: Start frame
+            end_frame: End frame (exclusive)
+            frame_step: Step between frames
+            
+        Returns:
+            traj: array of shape (num_frames, 8) or None if insufficient data
+        """
+        if self._ped_tracks is None or ped_id not in self._ped_tracks:
+            return None
+        
+        frames_expected = np.arange(start_frame, end_frame, frame_step)
+        ped_frames, ped_xy = self._ped_tracks[ped_id]
+        
+        # Find indices of expected frames using searchsorted
+        indices = np.searchsorted(ped_frames, frames_expected)
+        
+        # Validate all frames exist
+        if np.any(indices >= len(ped_frames)) or np.any(ped_frames[indices] != frames_expected):
+            return None
+        
+        # Extract positions
+        positions = ped_xy[indices]
+        
+        # Compute velocities
+        velocities = self.compute_velocity(positions)
+        
+        # Compute accelerations
+        accelerations = self.compute_velocity(velocities)
+        
+        # Build feature array with float32
+        traj = np.zeros((len(frames_expected), 8), dtype=np.float32)
+        traj[:, 0:2] = positions
+        traj[:, 2:4] = velocities
+        traj[:, 4:6] = accelerations
+        
+        return traj
+    
     def get_neighbors(self, df, ego_id, center_frame, max_neighbors=10, frame_step=10):
         """
         Get the N closest neighbors to the ego in the center frame
@@ -152,6 +192,59 @@ class ETHUCYProcessor:
             if traj is not None:
                 neighbors[i, :, :8] = traj
                 neighbors[i, :, 8] = 1  # flag de validez
+        
+        return neighbors
+    
+    def get_neighbors_fast(self, ego_id, center_frame, max_neighbors=10, frame_step=10):
+        """
+        Fast version of get_neighbors using cache.
+        
+        Returns:
+            neighbors: array of shape (max_neighbors, total_len, 9) or None
+        """
+        start_frame = center_frame - (self.obs_len - 1) * frame_step
+        end_frame = center_frame + (self.pred_len + 1) * frame_step
+        
+        # Get ego position at center frame
+        if self._ped_tracks is None or ego_id not in self._ped_tracks:
+            return None
+        
+        ego_frames, ego_xy = self._ped_tracks[ego_id]
+        ego_idx = np.searchsorted(ego_frames, center_frame)
+        if ego_idx >= len(ego_frames) or ego_frames[ego_idx] != center_frame:
+            return None
+        
+        ego_pos = ego_xy[ego_idx]
+        
+        # Get all pedestrians in center frame
+        if self._frame_index is None or center_frame not in self._frame_index:
+            neighbors = np.zeros((max_neighbors, self.total_len, 9), dtype=np.float32)
+            return neighbors
+        
+        frame_ped_ids, frame_xy = self._frame_index[center_frame]
+        
+        # Filter out ego
+        mask = frame_ped_ids != ego_id
+        neighbor_ids = frame_ped_ids[mask]
+        neighbor_xy = frame_xy[mask]
+        
+        if len(neighbor_ids) == 0:
+            neighbors = np.zeros((max_neighbors, self.total_len, 9), dtype=np.float32)
+            return neighbors
+        
+        # Calculate distances and sort
+        distances = np.linalg.norm(neighbor_xy - ego_pos, axis=1)
+        sorted_indices = np.argsort(distances)
+        neighbor_ids = neighbor_ids[sorted_indices[:max_neighbors]]
+        
+        # Extract trajectories
+        neighbors = np.zeros((max_neighbors, self.total_len, 9), dtype=np.float32)
+        
+        for i, neighbor_id in enumerate(neighbor_ids):
+            traj = self.get_trajectory_fast(neighbor_id, start_frame, end_frame, frame_step)
+            if traj is not None:
+                neighbors[i, :, :8] = traj
+                neighbors[i, :, 8] = 1
         
         return neighbors
     
@@ -236,6 +329,9 @@ class ETHUCYProcessor:
         # Load data
         df = self.load_csv(csv_path)
         
+        # Build cache once
+        self._build_cache(df)
+        
         print(f"Dataset cargado:")
         print(f"  - Total registros: {len(df)}")
         print(f"  - Frames únicos: {df['frame'].nunique()}")
@@ -247,7 +343,7 @@ class ETHUCYProcessor:
         skipped_count = 0
         
         for ped_id in tqdm(all_ped_ids, desc="Procesando peatones"):
-            ped_frames = df[df['ped_id'] == ped_id]['frame'].values
+            ped_frames, _ = self._ped_tracks[ped_id]
             
             min_frame = ped_frames.min() + (self.obs_len - 1) * frame_step
             max_frame = ped_frames.max() - self.pred_len * frame_step
@@ -255,13 +351,15 @@ class ETHUCYProcessor:
             sampling_step = frame_step * 2
             
             for center_frame in range(min_frame, max_frame + 1, sampling_step):
-                if center_frame not in ped_frames:
+                # Use searchsorted for O(log n) lookup
+                idx = np.searchsorted(ped_frames, center_frame)
+                if idx >= len(ped_frames) or ped_frames[idx] != center_frame:
                     continue
                 
                 start_frame = center_frame - (self.obs_len - 1) * frame_step
                 end_frame = center_frame + (self.pred_len + 1) * frame_step
                 
-                ego_traj = self.get_trajectory(df, ped_id, start_frame, end_frame, frame_step)
+                ego_traj = self.get_trajectory_fast(ped_id, start_frame, end_frame, frame_step)
                 
                 if ego_traj is None:
                     skipped_count += 1
@@ -272,7 +370,7 @@ class ETHUCYProcessor:
                 ego_future = ego_traj[self.obs_len:]  # shape: (12, 8)
                 
                 # Obtener vecinos
-                neighbors = self.get_neighbors(df, ped_id, center_frame, self.num_neighbors, frame_step)
+                neighbors = self.get_neighbors_fast(ped_id, center_frame, self.num_neighbors, frame_step)
                 
                 if neighbors is None:
                     skipped_count += 1
@@ -322,6 +420,9 @@ class ETHUCYProcessor:
         # Cargar datos
         df = self.load_csv(csv_path)
         
+        # Build cache once
+        self._build_cache(df)
+        
         print(f"Dataset cargado:")
         print(f"  - Total registros: {len(df)}")
         print(f"  - Frames únicos: {df['frame'].nunique()}")
@@ -337,7 +438,7 @@ class ETHUCYProcessor:
         
         for ped_id in tqdm(all_ped_ids, desc="Procesando peatones"):
             # Obtener frames donde aparece este peatón
-            ped_frames = df[df['ped_id'] == ped_id]['frame'].values
+            ped_frames, _ = self._ped_tracks[ped_id]
             
             # Deslizar ventana temporal
             # Necesitamos obs_len frames hacia atrás y pred_len hacia adelante
@@ -348,14 +449,16 @@ class ETHUCYProcessor:
             sampling_step = frame_step * 2  # muestrear cada 2 intervalos (20 frames)
             
             for center_frame in range(min_frame, max_frame + 1, sampling_step):
-                if center_frame not in ped_frames:
+                # Use searchsorted for O(log n) lookup
+                idx = np.searchsorted(ped_frames, center_frame)
+                if idx >= len(ped_frames) or ped_frames[idx] != center_frame:
                     continue
                 
                 # Extraer trayectoria del ego
                 start_frame = center_frame - (self.obs_len - 1) * frame_step
                 end_frame = center_frame + (self.pred_len + 1) * frame_step
                 
-                ego_traj = self.get_trajectory(df, ped_id, start_frame, end_frame, frame_step)
+                ego_traj = self.get_trajectory_fast(ped_id, start_frame, end_frame, frame_step)
                 
                 if ego_traj is None:
                     skipped_count += 1
@@ -366,7 +469,7 @@ class ETHUCYProcessor:
                 ego_future = ego_traj[self.obs_len:]  # shape: (12, 8)
                 
                 # Obtener vecinos
-                neighbors = self.get_neighbors(df, ped_id, center_frame, self.num_neighbors, frame_step)
+                neighbors = self.get_neighbors_fast(ped_id, center_frame, self.num_neighbors, frame_step)
                 
                 if neighbors is None:
                     skipped_count += 1

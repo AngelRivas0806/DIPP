@@ -66,32 +66,39 @@ python only_prediction/test_no_ego.py \
   --future_steps 12
 ```
 
-### Open-loop testing
-Run ```test_eth_ucy.py``` to test the trained planner in an open-loop manner. You need to specify the path to the original test dataset ```--test_set``` (path to the folder) and also the file path to the trained model ```--model_path```. Set ```--render``` to visualize the results and set ```--save``` to save the rendered images.
+### B. DIPP_model (Integrated planning)
 ```shell
-python test_eth_ucy.py \
---model_path training_log/leave_zara02_out_no_planning/model_11_0.1589.pth \
---test_set data/processed_leave_zara02_out/test \
---name leave_zara02_out_test \
---batch_size 32 \
---device cuda \
---visualize \
---num_vis_samples 20
+python process_eth_ucy.py \
+  --process_all \
+  --leave_out ucy-zara02 \
+  --output DIPP_model/data/processed_leave_zara02_out \
+  --split \
+  --obs_len 8 \
+  --pred_len 12 \
+  --fps 2.5 \
+  --num_neighbors 10
 ```
 
-### Closed-loop testing (Not at the moment)
-Run ```closed_loop_test.py``` to do closed-loop testing. You need to specify the file path to the original test data ```--test_file``` (a single file) and also the file path to the trained model ```--model_path```. Set ```--render``` to visualize the results and set ```--save``` to save the videos.
+### B.2 train
 ```shell
-python closed_loop_test.py \
---name closed_loop \
---test_file /path/to/original/test/data \
---model_path /path/to/saved/model \
---use_planning \
---render \
---save \
---device cpu
+python DIPP_model/train.py \
+  --name leave_zara02_out \
+  --train_set DIPP_model/data/processed_leave_zara02_out/train_combined/data.npz \
+  --valid_set DIPP_model/data/processed_leave_zara02_out/val_combined/data.npz \
+  --use_planning \
+  --batch_size 32 \
+  --train_epochs 50
 ```
-
+### B.3 test
+```shell
+python DIPP_model/train.py \
+  --name leave_zara02_out \
+  --train_set DIPP_model/data/processed_leave_zara02_out/train_combined/data.npz \
+  --valid_set DIPP_model/data/processed_leave_zara02_out/val_combined/data.npz \
+  --use_planning \
+  --batch_size 32 \
+  --train_epochs 50
+```
 ## Citation
 If you find the repo or the paper useful, please use the following citation:
 ```
