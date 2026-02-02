@@ -69,11 +69,11 @@ def plot_training_metrics(log_path, save_dir=None):
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, 'training_metrics.png')
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"✅ Gráfica guardada en: {save_path}")
+        print(f" Gráfica guardada en: {save_path}")
     else:
         # Solo guardar en raíz si NO se especificó save_dir
         plt.savefig('training_metrics.png', dpi=300, bbox_inches='tight')
-        print(f"✅ Gráfica guardada en: training_metrics.png")
+        print(f" Gráfica guardada en: training_metrics.png")
     
     # Mostrar estadísticas
     print("\n" + "="*60)
@@ -117,11 +117,11 @@ def plot_training_metrics(log_path, save_dir=None):
     if save_dir:
         save_path2 = os.path.join(save_dir, 'predictor_metrics.png')
         plt.savefig(save_path2, dpi=300, bbox_inches='tight')
-        print(f"✅ Gráfica guardada en: {save_path2}")
+        print(f" Gráfica guardada en: {save_path2}")
     else:
         # Solo guardar en raíz si NO se especificó save_dir
         plt.savefig('predictor_metrics.png', dpi=300, bbox_inches='tight')
-        print(f"✅ Gráfica guardada en: predictor_metrics.png")
+        print(f" Gráfica guardada en: predictor_metrics.png")
 
 
 def main():

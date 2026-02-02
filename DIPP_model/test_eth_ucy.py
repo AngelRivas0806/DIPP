@@ -12,7 +12,7 @@ import logging
 from tqdm import tqdm
 from utils.train_utils import DrivingData, bicycle_model, select_future
 from utils.visualization import plot_trajectory_prediction, plot_multiple_samples
-from model.predictor import Predictor
+from model.predictor import Predictor, NUM_MODES
 from model.planner import MotionPlanner
 from torch.utils.data import DataLoader
 
@@ -73,7 +73,7 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
             plans, predictions, scores, cost_function_weights = model(ego, neighbors)
             print(predictions.shape)
             # Generar trayectorias de planes
-            plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(3)], dim=1)
+            plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(NUM_MODES)], dim=1)
             
             # Seleccionar mejor futuro
             plan_traj, prediction = select_future(plan_trajs, predictions, scores)
@@ -85,14 +85,14 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
                 best_mode_idx = torch.argmax(scores, dim=1)
                 plan_control = plans[torch.arange(ego.shape[0]), best_mode_idx]  # (batch, 12, 2)
                 
-                # Create dummy ref_line_info
-                ref_line_info = torch.zeros(ego.shape[0], 1200, 5).to(device)
+                # Ground truth trajectory for trajectory following cost
+                gt_trajectory = ground_truth[:, 0, :, :3]  # ego's ground truth future
                 
                 planner_inputs = {
-                    "control_variables": plan_control.view(ego.shape[0], 24),  # 12 timesteps * 2 controls
+                    "control_variables": plan_control.view(ego.shape[0], 24),
                     "predictions": prediction,
-                    "ref_line_info": ref_line_info,
-                    "current_state": current_state
+                    "current_state": current_state,
+                    "gt_trajectory": gt_trajectory
                 }
                 
                 for i in range(cost_function_weights.shape[1]):
@@ -121,9 +121,10 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
             for b in range(neighbor_gt.shape[0]):
                 for n in range(neighbor_gt.shape[1]):
                     if valid_mask[b, n]:
+                        # Aplanar a (1, pred_len, 2) para compute_ade_fde
                         ade, fde = compute_ade_fde(
-                            neighbor_pred[b:b+1, n:n+1, :, :],
-                            neighbor_gt[b:b+1, n:n+1, :, :]
+                            neighbor_pred[b, n:n+1, :, :],  # (1, pred_len, 2)
+                            neighbor_gt[b, n:n+1, :, :]     # (1, pred_len, 2)
                         )
                         neighbor_ades.append(ade)
                         neighbor_fdes.append(fde)

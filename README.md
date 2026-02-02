@@ -1,4 +1,4 @@
-# SocialDIPP (Social Navigation for Mobile Robots with Differentiable Integrated Motion Prediction and Planning)
+## SocialDIPP (Social Navigation for Mobile Robots with Differentiable Integrated Motion Prediction and Planning)
 This repo is a fork of the original repo based in the following paper:
 
 **Differentiable Integrated Motion Prediction and Planning with Learnable Cost Function for Autonomous Driving**
@@ -25,54 +25,80 @@ conda activate DIPP
 Install the [Theseus library](https://github.com/facebookresearch/theseus), follow the guidelines.
 
 ## Usage
-### Data Processing
-Run ```process_eth_ucy.py``` to process the raw data for training. This will convert the original data format into a set of ```.npz``` files, each containing the data of a scene with the ego (first pedestrian of the tensor) and surrounding pedestrian. You need to specify the file path to the original data ```--load_path``` and the path to save the processed data ```--save_path``` . Example with Zara1: 
+Follow the following instructions according to what you need A or B:
+
+A). Only the trajectory prediction model
+
+    A.1 Preprocess
+
+    A.2 Train
+
+    A.3 Test
+
+B). Integrated planning and prediction with DIPP
+
+### A.1 Data Processing
+Process the data without considering the robot, you can configure the flags
 ```shell
 python process_eth_ucy.py \
- --dataset datasets/ucy-zara01/pixel_pos.csv \
- --output data/processed_data_zara01 \
- --fps 2.5 \
- --split \
+  --process_all \
+  --leave_out ucy-zara02 \
+  --output only_prediction/data \
+  --split \
+  --no_ego \
+  --pred_len 12
 ```
 
-### Training
-Run ```train.py``` to learn the predictor and planner (if set ```--use_planning```). You need to specify the file paths to training data ```--train_set``` and validation data ```--valid_set```. Leave other arguments vacant to use the default setting. Example with Zara1: 
+### A.2 Train
+ 
 ```shell
-python train.py \
---name zara01_model \
---train_set data/processed_data_zara01_train \
---valid_set data/processed_data_zara01_val \
---train_epochs 30 \
---batch_size 4 \
---learning_rate 0.00005 \
---use_planning
+python only_prediction/train_no_ego.py \
+  --train_set only_prediction/data/train_combined/data.npz \
+  --valid_set only_prediction/data/val_combined/data.npz \
+  --future_steps 12 \
+  --name leave_zara02_out_no_ego
 ```
-
-### Open-loop testing
-Run ```test_eth_ucy.py``` to test the trained planner in an open-loop manner. You need to specify the path to the original test dataset ```--test_set``` (path to the folder) and also the file path to the trained model ```--model_path```. Set ```--render``` to visualize the results and set ```--save``` to save the rendered images.
+### A.3 Test
 ```shell
-python test_eth_ucy.py \
---model_path training_log/zara01_model/model_10_0.1997.pth \
---test_set data/processed_data_zara01_test \
---name zara01_test_final \
---use_planning \
---visualize \
---num_vis_samples 20
+python only_prediction/test_no_ego.py \
+  --test_set only_prediction/data/test/data.npz \
+  --checkpoint only_prediction/checkpoints/leave_zara02_out_no_ego/best_model.pth \
+  --future_steps 12
 ```
 
-### Closed-loop testing (Not at the moment)
-Run ```closed_loop_test.py``` to do closed-loop testing. You need to specify the file path to the original test data ```--test_file``` (a single file) and also the file path to the trained model ```--model_path```. Set ```--render``` to visualize the results and set ```--save``` to save the videos.
+### B. DIPP_model (Integrated planning)
 ```shell
-python closed_loop_test.py \
---name closed_loop \
---test_file /path/to/original/test/data \
---model_path /path/to/saved/model \
---use_planning \
---render \
---save \
---device cpu
+python process_eth_ucy.py \
+  --process_all \
+  --leave_out ucy-zara02 \
+  --output DIPP_model/data/processed_leave_zara02_out \
+  --split \
+  --obs_len 8 \
+  --pred_len 12 \
+  --fps 2.5 \
+  --num_neighbors 10
 ```
 
+### B.2 train
+```shell
+python DIPP_model/train.py \
+  --name leave_zara02_out \
+  --train_set DIPP_model/data/processed_leave_zara02_out/train_combined/data.npz \
+  --valid_set DIPP_model/data/processed_leave_zara02_out/val_combined/data.npz \
+  --use_planning \
+  --batch_size 32 \
+  --train_epochs 50
+```
+### B.3 test
+```shell
+python DIPP_model/train.py \
+  --name leave_zara02_out \
+  --train_set DIPP_model/data/processed_leave_zara02_out/train_combined/data.npz \
+  --valid_set DIPP_model/data/processed_leave_zara02_out/val_combined/data.npz \
+  --use_planning \
+  --batch_size 32 \
+  --train_epochs 50
+```
 ## Citation
 If you find the repo or the paper useful, please use the following citation:
 ```
