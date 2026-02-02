@@ -3,6 +3,7 @@ Script de evaluación para datasets ETH/UCY procesados
 Open-loop testing (predicción sin replanning)
 """
 
+import sys
 import torch
 import argparse
 import numpy as np
@@ -61,15 +62,16 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(data_loader, desc="Evaluating")):
             # Preparar datos
-            ego = batch[0].to(device)
-            neighbors = batch[1].to(device)
+            ego          = batch[0].to(device)
+            neighbors    = batch[1].to(device)
             ground_truth = batch[2].to(device)
             
-            current_state = torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
-            
+            current_state= torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
+
+            print(neighbors.shape)
             # Predicción
             plans, predictions, scores, cost_function_weights = model(ego, neighbors)
-            
+            print(predictions.shape)
             # Generar trayectorias de planes
             plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(3)], dim=1)
             
@@ -139,7 +141,8 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
                         'neighbors_gt': neighbor_gt[b, :, :, :].cpu().numpy(),  # (num_neighbors, pred_len, 2)
                     }
                     vis_samples.append(sample_data)
-    
+    import sys
+    sys.exit()
     # Calcular promedios
     results = {
         'ego_ADE': np.mean(ego_ades),

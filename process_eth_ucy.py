@@ -149,6 +149,7 @@ class ETHUCYProcessor:
             traj = self.get_trajectory(df, neighbor_id, start_frame, end_frame, frame_step)
             if traj is not None:
                 neighbors[i, :, :8] = traj
+                # La ultima columna es un flag
                 neighbors[i, :, 8] = 1  # flag de validez
         
         return neighbors
