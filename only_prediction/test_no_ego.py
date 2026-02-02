@@ -9,7 +9,6 @@ import sys
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
 import time
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -17,81 +16,8 @@ from pathlib import Path
 # Añadir directorio padre al path para importar
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from only_prediction.predictor_no_ego import PredictorNoEgo
-from only_prediction.visualize_test_scenes import generate_scene_visualizations
-
-
-class TrajectoryDataset(Dataset):
-    """Dataset para trayectorias sin ego."""
-    
-    def __init__(self, data_path):
-        print(f"Loading test dataset from: {data_path}")
-        data = np.load(data_path)
-        
-        self.observed = torch.FloatTensor(data['observed_trajectory'])
-        self.future = torch.FloatTensor(data['gt_future_trajectory'])
-        
-        print(f"  - Loaded {len(self.observed)} test samples")
-        print(f"  - Observed shape: {self.observed.shape}")
-        print(f"  - Future shape: {self.future.shape}")
-    
-    def __len__(self):
-        return len(self.observed)
-    
-    def __getitem__(self, idx):
-        return self.observed[idx], self.future[idx], idx
-
-
-def compute_ade(pred_traj, gt_traj):
-    """
-    Average Displacement Error - minADE (best mode).
-    Args:
-        pred_traj: (batch, num_modes, future_steps, 2)
-        gt_traj: (batch, future_steps, 2)
-    Returns:
-        ade: escalar, promedio de distancias para el mejor modo
-    """
-    gt_expanded = gt_traj.unsqueeze(1)  # (batch, 1, future_steps, 2)
-    errors = torch.norm(pred_traj - gt_expanded, dim=-1)  # (batch, num_modes, future_steps)
-    ade_per_mode = errors.mean(dim=-1)  # (batch, num_modes)
-    min_ade = ade_per_mode.min(dim=-1)[0]  # (batch,)
-    return min_ade.mean(), min_ade
-
-
-def compute_fde(pred_traj, gt_traj):
-    """
-    Final Displacement Error - minFDE (best mode).
-    Args:
-        pred_traj: (batch, num_modes, future_steps, 2)
-        gt_traj: (batch, future_steps, 2)
-    Returns:
-        fde: escalar, error en el último timestep para el mejor modo
-    """
-    pred_final = pred_traj[:, :, -1, :]  # (batch, num_modes, 2)
-    gt_final = gt_traj[:, -1, :]  # (batch, 2)
-    gt_expanded = gt_final.unsqueeze(1)  # (batch, 1, 2)
-    errors = torch.norm(pred_final - gt_expanded, dim=-1)  # (batch, num_modes)
-    min_fde = errors.min(dim=-1)[0]  # (batch,)
-    return min_fde.mean(), min_fde
-
-
-def compute_miss_rate(pred_traj, gt_traj, threshold=2.0):
-    """
-    Miss Rate: porcentaje de predicciones donde el error final > threshold.
-    Args:
-        pred_traj: (batch, num_modes, future_steps, 2)
-        gt_traj: (batch, future_steps, 2)
-        threshold: umbral en metros (default: 2.0m)
-    Returns:
-        miss_rate: porcentaje de misses
-    """
-    pred_final = pred_traj[:, :, -1, :]  # (batch, num_modes, 2)
-    gt_final = gt_traj[:, -1, :]  # (batch, 2)
-    gt_expanded = gt_final.unsqueeze(1)  # (batch, 1, 2)
-    errors = torch.norm(pred_final - gt_expanded, dim=-1)  # (batch, num_modes)
-    min_errors = errors.min(dim=-1)[0]  # (batch,) - mejor modo
-    misses = (min_errors > threshold).float()
-    return misses.mean() * 100, misses  # porcentaje
+from predictor_no_ego import PredictorNoEgo
+from visualize_test_scenes import generate_scene_visualizations
 
 
 def test_model(model, dataloader, device, save_dir=None):

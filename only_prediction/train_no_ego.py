@@ -16,77 +16,93 @@ from datetime import datetime
 # Añadir directorio padre al path para importar
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from only_prediction.predictor_no_ego import PredictorNoEgo
+from predictor_no_ego import PredictorNoEgo
+from eval_utils import compute_ade, compute_fde
+from data_utils import TrajectoryDataset
 
+if False:
+    class TrajectoryDataset(Dataset):
+        """Dataset para trayectorias sin ego."""
+        
+        def __init__(self, data_path):
+            """
+            Args:
+                data_path: ruta al archivo .npz con datos preprocesados
+            """
+            print(f"Loading dataset from: {data_path}")
+            data = np.load(data_path)
+            
+            self.observed = torch.FloatTensor(data['observed_trajectory'])
+            self.future   = torch.FloatTensor(data['gt_future_trajectory'])
+            
+            print(f"  - Loaded {len(self.observed)} samples")
+            print(f"  - Observed shape: {self.observed.shape}")
+            print(f"  - Future shape: {self.future.shape}")
+        
+        def __len__(self):
+            return len(self.observed)
+        
+        def __getitem__(self, idx):
+            return self.observed[idx], self.future[idx]
 
-class TrajectoryDataset(Dataset):
-    """Dataset para trayectorias sin ego."""
-    
-    def __init__(self, data_path):
+    def compute_ade(pred_traj, gt_traj):
         """
+        Average Displacement Error - minADE (best mode).
         Args:
-            data_path: ruta al archivo .npz con datos preprocesados
+            pred_traj: (batch, num_modes, future_steps, 2)
+            gt_traj: (batch, future_steps, 2)
+        Returns:
+            ade: escalar, promedio de distancias para el mejor modo
         """
-        print(f"Loading dataset from: {data_path}")
-        data = np.load(data_path)
+        gt_expanded = gt_traj.unsqueeze(1)  # (batch, 1, future_steps, 2)
+        errors = torch.norm(pred_traj - gt_expanded, dim=-1)  # (batch, num_modes, future_steps)
+        ade_per_mode = errors.mean(dim=-1)  # (batch, num_modes)
+        min_ade = ade_per_mode.min(dim=-1)[0]  # (batch,)
+        return min_ade.mean(), min_ade
+
+    def compute_ade(pred_traj, gt_traj):
+        """
+        Average Displacement Error.
+        Args:
+            pred_traj: (batch, num_modes, future_steps, 2)
+            gt_traj: (batch, future_steps, 2)
+        Returns:
+            ade: escalar, promedio de distancias entre predicción y ground truth
+        """
+        # Calcular error para cada modo
+        gt_expanded = gt_traj.unsqueeze(1)  # (batch, 1, future_steps, 2)
+        errors = torch.norm(pred_traj - gt_expanded, dim=-1)  # (batch, num_modes, future_steps)
         
-        self.observed = torch.FloatTensor(data['observed_trajectory'])
-        self.future = torch.FloatTensor(data['gt_future_trajectory'])
+        # Promedio sobre timesteps
+        ade_per_mode = errors.mean(dim=-1)  # (batch, num_modes)
         
-        print(f"  - Loaded {len(self.observed)} samples")
-        print(f"  - Observed shape: {self.observed.shape}")
-        print(f"  - Future shape: {self.future.shape}")
-    
-    def __len__(self):
-        return len(self.observed)
-    
-    def __getitem__(self, idx):
-        return self.observed[idx], self.future[idx]
+        # Tomar el mejor modo (menor error)
+        min_ade = ade_per_mode.min(dim=-1)[0]  # (batch,)
+        
+        return min_ade.mean()
 
 
-def compute_ade(pred_traj, gt_traj):
-    """
-    Average Displacement Error.
-    Args:
-        pred_traj: (batch, num_modes, future_steps, 2)
-        gt_traj: (batch, future_steps, 2)
-    Returns:
-        ade: escalar, promedio de distancias entre predicción y ground truth
-    """
-    # Calcular error para cada modo
-    gt_expanded = gt_traj.unsqueeze(1)  # (batch, 1, future_steps, 2)
-    errors = torch.norm(pred_traj - gt_expanded, dim=-1)  # (batch, num_modes, future_steps)
-    
-    # Promedio sobre timesteps
-    ade_per_mode = errors.mean(dim=-1)  # (batch, num_modes)
-    
-    # Tomar el mejor modo (menor error)
-    min_ade = ade_per_mode.min(dim=-1)[0]  # (batch,)
-    
-    return min_ade.mean()
-
-
-def compute_fde(pred_traj, gt_traj):
-    """
-    Final Displacement Error.
-    Args:
-        pred_traj: (batch, num_modes, future_steps, 2)
-        gt_traj: (batch, future_steps, 2)
-    Returns:
-        fde: escalar, error en el último timestep
-    """
-    # Tomar última posición
-    pred_final = pred_traj[:, :, -1, :]  # (batch, num_modes, 2)
-    gt_final = gt_traj[:, -1, :]  # (batch, 2)
-    
-    # Calcular error para cada modo
-    gt_expanded = gt_final.unsqueeze(1)  # (batch, 1, 2)
-    errors = torch.norm(pred_final - gt_expanded, dim=-1)  # (batch, num_modes)
-    
-    # Tomar el mejor modo
-    min_fde = errors.min(dim=-1)[0]  # (batch,)
-    
-    return min_fde.mean()
+    def compute_fde(pred_traj, gt_traj):
+        """
+        Final Displacement Error.
+        Args:
+            pred_traj: (batch, num_modes, future_steps, 2)
+            gt_traj: (batch, future_steps, 2)
+        Returns:
+            fde: escalar, error en el último timestep
+        """
+        # Tomar última posición
+        pred_final = pred_traj[:, :, -1, :]  # (batch, num_modes, 2)
+        gt_final = gt_traj[:, -1, :]  # (batch, 2)
+        
+        # Calcular error para cada modo
+        gt_expanded = gt_final.unsqueeze(1)  # (batch, 1, 2)
+        errors = torch.norm(pred_final - gt_expanded, dim=-1)  # (batch, num_modes)
+        
+        # Tomar el mejor modo
+        min_fde = errors.min(dim=-1)[0]  # (batch,)
+        
+        return min_fde.mean()
 
 
 def train_epoch(model, dataloader, optimizer, device, epoch, total_epochs):
@@ -100,7 +116,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, total_epochs):
     
     start_time = time.time()
     
-    for batch_idx, (observed, future) in enumerate(dataloader):
+    for batch_idx, (observed, future, __) in enumerate(dataloader):
         observed = observed.to(device)
         future = future.to(device)
         
@@ -128,8 +144,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, total_epochs):
         
         # Métricas
         with torch.no_grad():
-            ade = compute_ade(predictions, future)
-            fde = compute_fde(predictions, future)
+            ade = compute_ade(predictions, future)[0]
+            fde = compute_fde(predictions, future)[0]
         
         total_loss += loss.item()
         total_ade += ade.item()
@@ -157,7 +173,7 @@ def validate(model, dataloader, device):
     num_batches = 0
     
     with torch.no_grad():
-        for observed, future in dataloader:
+        for observed, future, __ in dataloader:
             observed = observed.to(device)
             future = future.to(device)
             
@@ -175,8 +191,8 @@ def validate(model, dataloader, device):
             regression_loss = nn.MSELoss()(best_mode_predictions, future)
             loss = regression_loss + 0.1 * classification_loss
             
-            ade = compute_ade(predictions, future)
-            fde = compute_fde(predictions, future)
+            ade = compute_ade(predictions, future)[0]
+            fde = compute_fde(predictions, future)[0]
             
             total_loss += loss.item()
             total_ade += ade.item()
@@ -195,7 +211,7 @@ def main():
     
     # Arquitectura
     parser.add_argument('--obs_len', type=int, default=8)
-    parser.add_argument('--future_steps', type=int, default=8)
+    parser.add_argument('--future_steps', type=int, default=12)
     parser.add_argument('--num_modes', type=int, default=20)
     
     # Entrenamiento
