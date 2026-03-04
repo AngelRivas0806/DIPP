@@ -6,21 +6,24 @@ import torch.nn.functional as F
 NUM_MODES = 20
 
 """Agent history encoder
-# Encodes the historical trajectory of a pedestrian using an LSTM network."""
+# Encodes the historical trajectory of a pedestrian using an LSTM network.
+# Mas adelante en la clase Predictor, creamos dos instancias de este encoder, una para los
+# vecinos(comparten pesos)y una para el ego"""
 
 class AgentEncoder(nn.Module):
     def __init__(self):
         super(AgentEncoder, self).__init__()
-        self.motion = nn.LSTM(8, 256, 2, batch_first=True)
+        self.motion = nn.LSTM(6, 256, 2, batch_first=True)
     # return the last hidden state as the encoded feature, a tensor of shape (batch_size, 256).
     def forward(self, inputs):
-        traj, _ = self.motion(inputs[:, :, :8])
+        traj, _ = self.motion(inputs[:, :, :6])
         output = traj[:, -1]
 
         return output
 
 
-"""Multi-modal transformer module is used for agen2map, so we commented that code , we modified agent2agent to use it as well"""
+
+"""Multi-modal transformer module is used for agent2map, so we commented that code , we modified agent2agent to use it as well"""
 class MultiModalTransformer(nn.Module):
     def __init__(self, modes=NUM_MODES, output_dim=256):
         super(MultiModalTransformer, self).__init__()
@@ -40,7 +43,7 @@ class MultiModalTransformer(nn.Module):
 
 
 class Agent2Agent(nn.Module):
-    def __init__(self, modes=NUM_MODES):
+    def __init__(self, modes: int = NUM_MODES):
         super(Agent2Agent, self).__init__()
         self.modes = modes
         
@@ -92,7 +95,7 @@ class AgentDecoder(nn.Module):
         return traj
        
     def forward(self, agent_agent, current_state):
-        # View as [..., future_steps, 2] instead of 3
+        # View as [..., future_steps, 2] 
         decoded = self.decode(agent_agent).view(-1, self._num_modes, self._num_neighbors, self._future_steps, 2)
         trajs = torch.stack([self.transform(decoded[:, i, j], current_state[:, j]) for i in range(self._num_modes) for j in range(self._num_neighbors)], dim=1)
         trajs = torch.reshape(trajs, (-1, self._num_modes, self._num_neighbors, self._future_steps, 2))
@@ -102,31 +105,23 @@ class AgentDecoder(nn.Module):
 
 
 class AVDecoder(nn.Module):
-    def __init__(self, future_steps=12, feature_len=9, num_modes=NUM_MODES):
+    def __init__(self, future_steps=12, num_modes=NUM_MODES):
         super(AVDecoder, self).__init__()
         self._future_steps = future_steps
         self._num_modes = num_modes
         # Output control variables (acceleration and direction change) instead of trajectories
-        self.control = nn.Sequential(
-            nn.Dropout(0.1),
-            nn.Linear(256, 256),
-            nn.ELU(),
-            nn.Linear(256, future_steps*2)
-        )
+        self.control = nn.Sequential(nn.Dropout(0.1), nn.Linear(256, 256), nn.ELU(), nn.Linear(256, future_steps*2))
         
-        # All 9 cost weights are now learnable
-        self.cost_weights = nn.Parameter(torch.ones(feature_len, dtype=torch.float32))
+        # 6 cost weights learnable (one per cost term)
+        self.cost_weights = nn.Parameter(torch.ones(6, dtype=torch.float32))
 
         self.register_buffer('scale', torch.tensor([
-            0.5,   # weight[0]: acceleration_aux 
-            0.5,   # weight[1]: acceleration 
-            0.1,   # weight[2]: jerk 
-            0.1,   # weight[3]: steering 
-            0.1,   # weight[4]: steering_change 
-            5.0,   # weight[5]: collision_avoidance 
-            2.0,   # weight[6]: trajectory_following_aux1
-            2.0,   # weight[7]: trajectory_following
-            2.0,   # weight[8]: trajectory_following_aux2
+            0.5,   # weight[0]: acceleration
+            0.1,   # weight[1]: jerk
+            0.1,   # weight[2]: steering
+            0.1,   # weight[3]: steering_change
+            5.0,   # weight[4]: collision_avoidance
+            2.0,   # weight[5]: trajectory_following
         ], dtype=torch.float32))
 
     def forward(self, agent_agent, current_state):
@@ -134,11 +129,11 @@ class AVDecoder(nn.Module):
         actions = self.control(agent_agent).view(-1, self._num_modes, self._future_steps, 2)
 
         # Generate cost function weights (all learnable, scaled for pedestrians)
-        norm_weights = torch.softmax(self.cost_weights, dim=0)  # (9,)
-        scaled_weights = norm_weights * self.scale  # (9,) - all 9 weights are now scaled
+        norm_weights = torch.softmax(self.cost_weights, dim=0)  # (6,)
+        scaled_weights = norm_weights * self.scale  # (6,)
         
         # Expand to batch dimension for compatibility
-        cost_function_weights = scaled_weights.unsqueeze(0).expand(actions.shape[0], -1)  # (B, 9)
+        cost_function_weights = scaled_weights.unsqueeze(0).expand(actions.shape[0], -1)  # (B, 6)
 
 
         return actions, cost_function_weights
@@ -176,22 +171,18 @@ class Predictor(nn.Module):
 
     def forward(self, ego, neighbors):
         """
-        ego:       (B, T_obs, feat_dim)              # peatón ego
+        ego:       (B, T_obs, feat_dim)          
         neighbors: (B, num_neighbors, T_obs, feat_dim)
-                    feat_dim: 2 o 3 (x,y,(θ))
         """
         B = ego.shape[0]
 
         ego_embed = self.pedestrian_net(ego)  # (B, 256)
 
-        neighbor_embeds = torch.stack(
-            [self.pedestrian_net(neighbors[:, i]) for i in range(self._num_neighbors)],
-            dim=1
-        )  # (B, num_neighbors, 256)
+        neighbor_embeds = torch.stack([self.pedestrian_net(neighbors[:, i]) for i in range(self._num_neighbors)], dim=1)  
+        # (B, num_neighbors, 256)
 
         actors = torch.cat([ego_embed.unsqueeze(1), neighbor_embeds], dim=1)
 
-        B = ego.shape[0]
         device = ego.device
 
         ego_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)  # (B,1)
@@ -216,6 +207,6 @@ class Predictor(nn.Module):
 
 
 if __name__ == "__main__":
-    model = Predictor(50)
+    model = Predictor(12)
     print(model)
     print('Model Params:', sum(p.numel() for p in model.parameters()))

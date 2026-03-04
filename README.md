@@ -25,79 +25,69 @@ conda activate DIPP
 Install the [Theseus library](https://github.com/facebookresearch/theseus), follow the guidelines.
 
 ## Usage
-Follow the following instructions according to what you need A or B:
 
-A). Only the trajectory prediction model
+Integrated planning and prediction with DIPP
 
-    A.1 Preprocess
-
-    A.2 Train
-
-    A.3 Test
-
-B). Integrated planning and prediction with DIPP
-
-### A.1 Data Processing
-Process the data without considering the robot, you can configure the flags
+### Data Processing
+1.1 Process the data in joint scenes without considering the robot, you can configure the flags
 ```shell
 python process_eth_ucy.py \
-  --process_all \
+  --datasets_dir datasets \
+  --out_dir DIPP_model/data \
   --leave_out ucy-zara02 \
-  --output only_prediction/data \
   --split \
-  --no_ego \
-  --pred_len 12
-```
+  --k_neighbors 10 \
+  --neighbor_radius 3.0
 
-### A.2 Train
- 
-```shell
-python only_prediction/train_no_ego.py \
-  --train_set only_prediction/data/train_combined/data.npz \
-  --valid_set only_prediction/data/val_combined/data.npz \
-  --future_steps 12 \
-  --name leave_zara02_out_no_ego
 ```
-### A.3 Test
+Posteriormente si quieres visualizar tus datos ejecuta:
 ```shell
-python only_prediction/test_no_ego.py \
-  --test_set only_prediction/data/test/data.npz \
-  --checkpoint only_prediction/checkpoints/leave_zara02_out_no_ego/best_model.pth \
-  --future_steps 12
+python vis.py --npz DIPP_model/data/train/data.npz --random --ego_frame --rotate
 ```
-
-### B. DIPP_model (Integrated planning)
-```shell
-python process_eth_ucy.py \
-  --process_all \
-  --leave_out ucy-zara02 \
-  --output DIPP_model/data/processed_leave_zara02_out \
-  --split \
-  --obs_len 8 \
-  --pred_len 12 \
-  --fps 2.5 \
-  --num_neighbors 10
-```
-
-### B.2 train
+### 2.1 DIPP_model train (Whitout planning)
 ```shell
 python DIPP_model/train.py \
-  --name leave_zara02_out \
-  --train_set DIPP_model/data/processed_leave_zara02_out/train_combined/data.npz \
-  --valid_set DIPP_model/data/processed_leave_zara02_out/val_combined/data.npz \
-  --use_planning \
+  --name Exp1_noplan \
+  --train_set DIPP_model/data/train/data.npz \
+  --valid_set DIPP_model/data/val/data.npz \
+  --device cuda \
   --batch_size 32 \
-  --train_epochs 50
+  --train_epochs 10
 ```
-### B.3 test
+
+### 2.2 DIPP_model train (Integrated planning)
 ```shell
 python DIPP_model/train.py \
-  --name leave_zara02_out \
-  --train_set DIPP_model/data/processed_leave_zara02_out/train_combined/data.npz \
-  --valid_set DIPP_model/data/processed_leave_zara02_out/val_combined/data.npz \
+  --name Exp1_plan \
+  --train_set DIPP_model/data/train/data.npz \
+  --valid_set DIPP_model/data/val/data.npz \
+  --device cuda \
   --use_planning \
   --batch_size 32 \
-  --train_epochs 50
+  --train_epochs 10
+```
+
+### 2.3 test
+Elegir en model_path algun modelo entrenado y espcificarlo
+```shell
+python DIPP_model/test_eth_ucy.py \
+  --model_path DIPP_model/training_log/Exp1_plan/model_10_0.2293.pth \
+  --name Exp1_plan \
+  --test_set DIPP_model/data/val/data.npz \
+  --device cuda \
+  --use_planning
+```
+
+### 2.4 Visualization
+```shell
+python DIPP_model/test_eth_ucy.py \
+  --model_path DIPP_model/training_log/Exp1_plan/model_10_0.2293.pth \
+  --name Exp1_plan_vis \
+  --test_set DIPP_model/data/val/data.npz \
+  --device cuda \
+  --use_planning \
+  --visualize \
+  --min_neighbors 5
 ```
 ## Citation
 If you find the repo or the paper useful, please use the following citation:

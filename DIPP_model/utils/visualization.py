@@ -76,8 +76,8 @@ def plot_trajectory_prediction(ego_hist, ego_pred, ego_gt,
         num_neighbors = neighbors_hist.shape[0]
         
         for i in range(num_neighbors):
-            # Verificar si el vecino es válido (tiene datos)
-            if np.sum(np.abs(neighbors_gt[i])) == 0:
+            # Verificar si el vecino es válido (tiene historia)
+            if np.sum(np.abs(neighbors_hist[i])) == 0:
                 continue
             
             # Historia del vecino
@@ -123,7 +123,7 @@ def plot_trajectory_prediction(ego_hist, ego_pred, ego_gt,
     
     if neighbors_hist is not None:
         for i in range(neighbors_hist.shape[0]):
-            if np.sum(np.abs(neighbors_gt[i])) > 0:
+            if np.sum(np.abs(neighbors_hist[i])) > 0:
                 all_x = np.concatenate([all_x, neighbors_hist[i, :, 0], 
                                        neighbors_pred[i, :, 0], neighbors_gt[i, :, 0]])
                 all_y = np.concatenate([all_y, neighbors_hist[i, :, 1], 

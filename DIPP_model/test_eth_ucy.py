@@ -41,7 +41,8 @@ def compute_ade_fde(predictions, ground_truth):
 
 
 def evaluate_model(model, data_loader, device, use_planning=False, planner=None, 
-                  visualize=False, vis_path=None, num_vis_samples=10):
+                  visualize=False, vis_path=None, num_vis_samples=10, min_neighbors=0,
+                  raw_dataset=None):
     """
     Evaluar el modelo en un conjunto de datos
     
@@ -56,6 +57,22 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
     ego_ades, ego_fdes = [], []
     neighbor_ades, neighbor_fdes = [], []
     
+    # Pre-calcular índices candidatos para visualización (distribuidos uniformemente)
+    vis_candidate_indices = set()
+    if visualize and raw_dataset is not None:
+        neighbors_raw = raw_dataset.neighbors  # (N, K, obs, 7)
+        valid_counts = np.array([
+            int(np.sum(np.sum(np.abs(neighbors_raw[i]), axis=(1, 2)) > 0))
+            for i in range(len(raw_dataset))
+        ])
+        candidates = np.where(valid_counts >= min_neighbors)[0]
+        if len(candidates) >= num_vis_samples:
+            step = len(candidates) // num_vis_samples
+            selected = candidates[::step][:num_vis_samples]
+        else:
+            selected = candidates
+        vis_candidate_indices = set(int(x) for x in selected)
+
     # Datos para visualización
     vis_samples = []
     
@@ -68,10 +85,8 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
             
             current_state= torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
 
-            print(neighbors.shape)
             # Predicción
             plans, predictions, scores, cost_function_weights = model(ego, neighbors)
-            print(predictions.shape)
             # Generar trayectorias de planes
             plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(NUM_MODES)], dim=1)
             
@@ -86,7 +101,7 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
                 plan_control = plans[torch.arange(ego.shape[0]), best_mode_idx]  # (batch, 12, 2)
                 
                 # Ground truth trajectory for trajectory following cost
-                gt_trajectory = ground_truth[:, 0, :, :3]  # ego's ground truth future
+                gt_trajectory = ground_truth[:, 0, :, :2]  # ego's ground truth future (x,y)
                 
                 planner_inputs = {
                     "control_variables": plan_control.view(ego.shape[0], 24),
@@ -95,8 +110,13 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
                     "gt_trajectory": gt_trajectory
                 }
                 
-                for i in range(cost_function_weights.shape[1]):
-                    planner_inputs[f'cost_function_weight_{i+1}'] = cost_function_weights[:, i].unsqueeze(1)
+                w = cost_function_weights  # (B, 6)
+                planner_inputs["w_acc"] = w[:, 0].unsqueeze(1)
+                planner_inputs["w_jerk"] = w[:, 1].unsqueeze(1)
+                planner_inputs["w_steer"] = w[:, 2].unsqueeze(1)
+                planner_inputs["w_steer_change"] = w[:, 3].unsqueeze(1)
+                planner_inputs["w_collision"] = w[:, 4].unsqueeze(1)
+                planner_inputs["w_tracking"] = w[:, 5].unsqueeze(1)
                 
                 final_values, info = planner.layer.forward(planner_inputs)
                 refined_control = final_values["control_variables"].view(-1, 12, 2)
@@ -131,19 +151,58 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
             
             # ========== VISUALIZACIÓN ==========
             if visualize and len(vis_samples) < num_vis_samples:
-                # Guardar algunas muestras para visualizar
-                for b in range(min(ego.shape[0], num_vis_samples - len(vis_samples))):
+                batch_start = batch_idx * data_loader.batch_size
+                for b in range(ego.shape[0]):
+                    if len(vis_samples) >= num_vis_samples:
+                        break
+                    global_idx = batch_start + b
+                    if global_idx not in vis_candidate_indices:
+                        continue
+
+                    nb_hist = neighbors[b, :, :, :2].cpu().numpy()
+                    n_valid = int(np.sum([np.sum(np.abs(nb_hist[n])) > 0 for n in range(nb_hist.shape[0])]))
+
+                    # --- Desnormalización ---
+                    if raw_dataset is not None:
+                        raw_idx = batch_start + b
+                        raw_ego = raw_dataset.ego[raw_idx]          # (obs, 6) sin normalizar
+                        ego_pos0 = raw_ego[-1, :2].copy()           # traslación
+                        vx, vy = float(raw_ego[-1, 2]), float(raw_ego[-1, 3])
+                        heading = float(np.arctan2(vy, vx)) if abs(vx) > 1e-2 or abs(vy) > 1e-2 else 0.0
+                        c, s = np.cos(heading), np.sin(heading)     # inverso: +heading
+
+                        def denorm_xy(xy):
+                            # xy: (..., 2)  rot con +heading luego traslada
+                            xr = xy[..., 0] * c - xy[..., 1] * s
+                            yr = xy[..., 0] * s + xy[..., 1] * c
+                            out = np.stack([xr, yr], axis=-1)
+                            out = out + ego_pos0
+                            return out
+
+                        ego_hist_dn   = denorm_xy(ego[b, :, :2].cpu().numpy())
+                        ego_pred_dn   = denorm_xy(ego_pred[b, :, :].cpu().numpy())
+                        ego_gt_dn     = denorm_xy(ego_gt[b, :, :].cpu().numpy())
+                        nb_hist_dn    = denorm_xy(nb_hist)
+                        nb_pred_dn    = denorm_xy(neighbor_pred[b, :, :, :].cpu().numpy())
+                        nb_gt_dn      = denorm_xy(neighbor_gt[b, :, :, :].cpu().numpy())
+                    else:
+                        ego_hist_dn  = ego[b, :, :2].cpu().numpy()
+                        ego_pred_dn  = ego_pred[b, :, :].cpu().numpy()
+                        ego_gt_dn    = ego_gt[b, :, :].cpu().numpy()
+                        nb_hist_dn   = nb_hist
+                        nb_pred_dn   = neighbor_pred[b, :, :, :].cpu().numpy()
+                        nb_gt_dn     = neighbor_gt[b, :, :, :].cpu().numpy()
+
                     sample_data = {
-                        'ego_hist': ego[b, :, :2].cpu().numpy(),  # (obs_len, 2)
-                        'ego_pred': ego_pred[b, :, :].cpu().numpy(),  # (pred_len, 2)
-                        'ego_gt': ego_gt[b, :, :].cpu().numpy(),  # (pred_len, 2)
-                        'neighbors_hist': neighbors[b, :, :, :2].cpu().numpy(),  # (num_neighbors, obs_len, 2)
-                        'neighbors_pred': neighbor_pred[b, :, :, :].cpu().numpy(),  # (num_neighbors, pred_len, 2)
-                        'neighbors_gt': neighbor_gt[b, :, :, :].cpu().numpy(),  # (num_neighbors, pred_len, 2)
+                        'ego_hist': ego_hist_dn,
+                        'ego_pred': ego_pred_dn,
+                        'ego_gt':   ego_gt_dn,
+                        'neighbors_hist': nb_hist_dn,
+                        'neighbors_pred': nb_pred_dn,
+                        'neighbors_gt':   nb_gt_dn,
+                        'num_valid_neighbors': int(n_valid),
                     }
                     vis_samples.append(sample_data)
-    import sys
-    sys.exit()
     # Calcular promedios
     results = {
         'ego_ADE': np.mean(ego_ades),
@@ -168,6 +227,7 @@ def main():
     parser.add_argument('--device', type=str, default='cuda', help='Device to use')
     parser.add_argument('--visualize', action='store_true', help='Generate visualizations')
     parser.add_argument('--num_vis_samples', type=int, default=10, help='Number of samples to visualize')
+    parser.add_argument('--min_neighbors', type=int, default=0, help='Minimum valid neighbors to include a sample in visualization')
     
     args = parser.parse_args()
     
@@ -203,12 +263,12 @@ def main():
     if args.use_planning:
         logging.info("Setting up planner...")
         trajectory_len, feature_len = 12, 9
-        planner = MotionPlanner(trajectory_len, feature_len, args.device)
+        planner = MotionPlanner(trajectory_len, args.device)
         logging.info("Planner ready!")
     
     # Cargar datos
     logging.info("Loading test data...")
-    test_set = DrivingData(args.test_set + '/*')
+    test_set = DrivingData(args.test_set)
     test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
     logging.info(f"Test set: {len(test_set)} samples")
     
@@ -222,7 +282,9 @@ def main():
                             args.use_planning, planner,
                             visualize=args.visualize, 
                             vis_path=vis_path,
-                            num_vis_samples=args.num_vis_samples)
+                            num_vis_samples=args.num_vis_samples,
+                            min_neighbors=args.min_neighbors,
+                            raw_dataset=test_set)
     
     # Generar visualizaciones
     if args.visualize and len(results['vis_samples']) > 0:
