@@ -53,7 +53,7 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
             weights_to_print = cost_function_weights[0].detach().cpu().numpy()
             np.set_printoptions(precision=4, suppress=True)
             print(f"\n{'='*50}")
-            print(f"INSPECCIÓN DE PESOS PARA VER SI SE ESTAN APRENDIENDO (Inicio de la Época)")
+            print(f"Inicio de la Época")
             print(f"Cost Weights: {weights_to_print}")
             print(f"{'='*50}\n")
 
@@ -247,7 +247,7 @@ def model_training():
 
     # optimizer
     optimizer = optim.Adam(predictor.parameters(), lr=args.learning_rate)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=1)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.98)
 
     train_epochs = args.train_epochs
     batch_size = args.batch_size
@@ -353,7 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("--valid_set", type=str, help="path to validation datasets", required=True)
     parser.add_argument("--seed", type=int, help="fix random seed", default=42)
     parser.add_argument("--num_workers", type=int, default=8, help="number of workers used for dataloader")
-    parser.add_argument("--pretrain_epochs", type=int, help="epochs of pretraining predictor", default=3)
+    parser.add_argument("--pretrain_epochs", type=int, help="epochs of pretraining predictor", default=10)
     parser.add_argument("--train_epochs", type=int, help="epochs of training", default=20)
     parser.add_argument("--batch_size", type=int, help="batch size (default: 32)", default=32)
     parser.add_argument("--learning_rate", type=float, help="learning rate (default: 2e-4)", default=2e-4)

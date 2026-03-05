@@ -67,18 +67,10 @@ python DIPP_model/train.py \
   --train_epochs 10
 ```
 
-### 2.3 test
-Elegir en model_path algun modelo entrenado y espcificarlo
-```shell
-python DIPP_model/test_eth_ucy.py \
-  --model_path DIPP_model/training_log/Exp1_plan/model_10_0.2293.pth \
-  --name Exp1_plan \
-  --test_set DIPP_model/data/val/data.npz \
-  --device cuda \
-  --use_planning
-```
 
-### 2.4 Visualization
+
+### 2.3 Test and Visualization
+If you are realizing the train without planning so you must use the flag --use_planning, in another case use this flag
 ```shell
 python DIPP_model/test_eth_ucy.py \
   --model_path DIPP_model/training_log/Exp1_plan/model_10_0.2293.pth \
@@ -86,7 +78,6 @@ python DIPP_model/test_eth_ucy.py \
   --test_set DIPP_model/data/val/data.npz \
   --device cuda \
   --use_planning \
-  --visualize \
   --min_neighbors 5
 ```
 ## Citation

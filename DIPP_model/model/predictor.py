@@ -75,20 +75,20 @@ class AgentDecoder(nn.Module):
         self._future_steps = future_steps 
         self._num_neighbors = num_neighbors
         self._num_modes = num_modes
-        # Output only 2 values (delta_x, delta_y) per step
+        # Output only 2 values (vx, vy) per step
         self.decode = nn.Sequential(nn.Dropout(0.1), nn.Linear(256, 256), nn.ELU(), nn.Linear(256, future_steps*2))
 
-    def transform(self, prediction, current_state):
-        x = current_state[:, 0] 
-        y = current_state[:, 1]
-        # Ignore theta/velocity from input, we only predict position
-        
-        delta_x = prediction[:, :, 0]
-        delta_y = prediction[:, :, 1]
-        
-        new_x = x.unsqueeze(1) + delta_x 
-        new_y = y.unsqueeze(1) + delta_y 
-        
+    def transform(self, prediction, current_state, dt: float = 0.4):
+        x = current_state[:, 0]  # (B,)
+        y = current_state[:, 1]  # (B,)
+
+        vx = prediction[:, :, 0]  # (B, T)
+        vy = prediction[:, :, 1]  # (B, T)
+
+        # Integrar velocidades → posiciones acumuladas
+        new_x = x.unsqueeze(1) + torch.cumsum(vx * dt, dim=1)
+        new_y = y.unsqueeze(1) + torch.cumsum(vy * dt, dim=1)
+
         # Output: [x, y]
         traj = torch.stack([new_x, new_y], dim=-1)
 

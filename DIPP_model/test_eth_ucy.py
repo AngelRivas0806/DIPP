@@ -225,7 +225,6 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for testing')
     parser.add_argument('--use_planning', action='store_true', help='Use planning module')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use')
-    parser.add_argument('--visualize', action='store_true', help='Generate visualizations')
     parser.add_argument('--num_vis_samples', type=int, default=10, help='Number of samples to visualize')
     parser.add_argument('--min_neighbors', type=int, default=0, help='Minimum valid neighbors to include a sample in visualization')
     
@@ -277,17 +276,17 @@ def main():
     logging.info("Starting evaluation...")
     logging.info(f"{'='*60}\n")
     
-    vis_path = f"{log_path}/visualizations" if args.visualize else None
+    vis_path = f"{log_path}/visualizations"
     results = evaluate_model(predictor, test_loader, args.device, 
                             args.use_planning, planner,
-                            visualize=args.visualize, 
+                            visualize=True, 
                             vis_path=vis_path,
                             num_vis_samples=args.num_vis_samples,
                             min_neighbors=args.min_neighbors,
                             raw_dataset=test_set)
     
     # Generar visualizaciones
-    if args.visualize and len(results['vis_samples']) > 0:
+    if len(results['vis_samples']) > 0:
         logging.info(f"\n{'='*60}")
         logging.info("Generating visualizations...")
         logging.info(f"{'='*60}\n")

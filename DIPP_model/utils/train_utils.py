@@ -203,80 +203,66 @@ def _neighbor_presence_mask_from_weights(weights: torch.Tensor, N: int, T: int, 
 # Loss + Selection
 # =========================================================
 def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Optional[torch.Tensor] = None):
-    """
-    Compatibilidad: si no pasas best_mode, se calcula aquí como antes.
-    Cambios críticos:
-      - No usa global best_mode.
-      - Usa máscara booleana para vecinos.
-      - Mantiene la idea original: elegir modo con dist en frames [5,11] y entrenar scores con CE.
-    """
-    # predictions: [B, modes, neighbors, T, 2]
-    # plans:       [B, modes, T, 3]  (x,y,theta) (o al menos x,y)
-    # ground_truth:[B, agents, T, F] agents=1+neighbors
     B, M, T, _ = plans.shape
     _, _, N, _, _ = predictions.shape
 
     # Máscara de vecinos presentes (B,N,T,1)
     neigh_mask = _neighbor_presence_mask_from_weights(weights, N=N, T=T, device=plans.device)
-    # Para “existió alguna vez”
     neigh_any = neigh_mask.any(dim=2, keepdim=True)  # (B,N,1,1)
 
-    # Aplica máscara a predicciones (solo para distancias y loss)
-    predictions_masked = predictions * neigh_any[:, None].float()  # (B,1,N,1,1)
-
-    # ---- Selección best_mode (como tu idea original)
-    # usa frames 5 y 11 (requiere T>=12)
-    idx = [5, 11] if T > 11 else [max(0, T//2), T-1]
-
-    # dist vecinos en esos frames
-    pred_dist = torch.norm(
-        predictions_masked[:, :, :, idx, :2] - ground_truth[:, None, 1:, idx, :2],
-        dim=-1
-    )  # (B,M,N,len(idx))
-    plan_dist = torch.norm(
-        plans[:, :, idx, :2] - ground_truth[:, None, 0, idx, :2],
-        dim=-1
-    )  # (B,M,len(idx))
-
-    pred_dist = pred_dist.mean(-1).sum(-1)  # (B,M)
-    plan_dist = plan_dist.mean(-1)          # (B,M)
+    predictions_masked = predictions * neigh_any[:, None].float()
 
     if best_mode is None:
-        best_mode = torch.argmin(plan_dist + pred_dist, dim=-1)  # (B,)
+        # ---- Pérdida conjunta por modo: ego + vecinos promediados
+        # Ego: (B, M)
+        ego_loss_per_mode = F.smooth_l1_loss(
+            plans[:, :, :, :2],                          # (B, M, T, 2)
+            ground_truth[:, None, 0, :, :2].expand(-1, M, -1, -1),  # (B, M, T, 2)
+            reduction='none'
+        ).mean(dim=[-1, -2])  # (B, M)
+
+        # Vecinos: (B, M, N, T, 2) → (B, M)
+        nei_loss_per_mode = F.smooth_l1_loss(
+            predictions_masked[:, :, :, :, :2],          # (B, M, N, T, 2)
+            ground_truth[:, None, 1:, :, :2].expand(-1, M, -1, -1, -1),  # (B, M, N, T, 2)
+            reduction='none'
+        ).mean(dim=-1)  # (B, M, N, T)
+
+        # Enmascarar vecinos ausentes y promediar
+        nei_loss_per_mode = (nei_loss_per_mode * neigh_mask[:, None, :, :, 0].float()).sum(dim=[-1, -2])  # (B, M, N) → (B, M)
+        n_valid = neigh_any[:, :, 0, 0].float().sum(dim=1, keepdim=True).clamp_min(1.0)  # (B, 1)
+        nei_loss_per_mode = nei_loss_per_mode / n_valid  # (B, M)
+
+        # Pérdida conjunta: promedio ego + vecinos por modo
+        joint_loss_per_mode = (ego_loss_per_mode + nei_loss_per_mode) / (1 + n_valid)  # (B, M)
+        best_mode = torch.argmin(joint_loss_per_mode, dim=-1)  # (B,)
 
     score_loss = F.cross_entropy(scores, best_mode)
 
-    # Seleccionar el modo
-    best_mode_plan = plans[torch.arange(B, device=plans.device), best_mode]              # (B,T,3)
-    best_mode_pred = predictions_masked[torch.arange(B, device=plans.device), best_mode] # (B,N,T,2)
+    # Seleccionar modo ganador
+    best_mode_plan = plans[torch.arange(B, device=plans.device), best_mode]               # (B,T,3)
+    best_mode_pred = predictions_masked[torch.arange(B, device=plans.device), best_mode]  # (B,N,T,2)
 
-    # Construir "prediction" concatenado (ego + vecinos) para mantener tu lógica
-    dummy_theta = torch.zeros_like(best_mode_pred[:, :, :, :1])        # (B,N,T,1)
-    best_mode_pred_3d = torch.cat([best_mode_pred, dummy_theta], dim=-1)  # (B,N,T,3)
+    dummy_theta = torch.zeros_like(best_mode_pred[:, :, :, :1])
+    best_mode_pred_3d = torch.cat([best_mode_pred, dummy_theta], dim=-1)
     prediction_all = torch.cat([best_mode_plan.unsqueeze(1), best_mode_pred_3d], dim=1)  # (B,1+N,T,3)
 
-    # ---- Loss: ego (3 si posible), vecinos (2)
+    # ---- Loss sobre modo ganador
     pred_loss = 0.0
 
     # Ego
-    if ground_truth.shape[-1] >= 3:
-        pred_loss = pred_loss + F.smooth_l1_loss(prediction_all[:, 0, :, :3], ground_truth[:, 0, :, :3])
-        pred_loss = pred_loss + F.smooth_l1_loss(prediction_all[:, 0, -1, :3], ground_truth[:, 0, -1, :3])
-    else:
-        pred_loss = pred_loss + F.smooth_l1_loss(prediction_all[:, 0, :, :2], ground_truth[:, 0, :, :2])
-        pred_loss = pred_loss + F.smooth_l1_loss(prediction_all[:, 0, -1, :2], ground_truth[:, 0, -1, :2])
+    pred_loss = pred_loss + F.smooth_l1_loss(prediction_all[:, 0, :, :2], ground_truth[:, 0, :, :2])
+    pred_loss = pred_loss + F.smooth_l1_loss(prediction_all[:, 0, -1, :2], ground_truth[:, 0, -1, :2])
 
-    # Vecinos: enmascarar para ignorar vecinos ausentes
-    # ground_truth vecinos: (B,N,T,2)
-    gt_nei_xy = ground_truth[:, 1:, :, :2]
-    pred_nei_xy = prediction_all[:, 1:, :, :2]  # (B,N,T,2)
-    nei_l = F.smooth_l1_loss(pred_nei_xy, gt_nei_xy, reduction="none").mean(dim=-1, keepdim=True)  # (B,N,T,1)
-    nei_l = (nei_l * neigh_mask.float()).sum() / (neigh_mask.float().sum().clamp_min(1.0))
+    # Vecinos enmascarados
+    gt_nei_xy   = ground_truth[:, 1:, :, :2]
+    pred_nei_xy = prediction_all[:, 1:, :, :2]
+    nei_l = F.smooth_l1_loss(pred_nei_xy, gt_nei_xy, reduction='none').mean(dim=-1, keepdim=True)
+    nei_l = (nei_l * neigh_mask.float()).sum() / neigh_mask.float().sum().clamp_min(1.0)
     pred_loss = pred_loss + nei_l
 
-    # último punto vecinos (también enmascarado por "existió")
-    nei_last = F.smooth_l1_loss(pred_nei_xy[:, :, -1, :], gt_nei_xy[:, :, -1, :], reduction="none").mean(dim=-1, keepdim=True)  # (B,N,1)
-    nei_last = (nei_last * neigh_any.squeeze(-1).float()).sum() / (neigh_any.squeeze(-1).float().sum().clamp_min(1.0))
+    nei_last = F.smooth_l1_loss(pred_nei_xy[:, :, -1, :], gt_nei_xy[:, :, -1, :], reduction='none').mean(dim=-1, keepdim=True)
+    nei_last = (nei_last * neigh_any.squeeze(-1).float()).sum() / neigh_any.squeeze(-1).float().sum().clamp_min(1.0)
     pred_loss = pred_loss + nei_last
 
     total = 0.5 * pred_loss + score_loss
