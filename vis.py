@@ -34,7 +34,10 @@ def print_neighbor_count_stats(data, flag_idx: int = 6):
         print(f"[neighbor stats] flag_idx={flag_idx} fuera de rango. F={F}")
         return
 
+    # flag_idx is the index of the feature that indicates if the neighbor is valid 
+    # For each sample/neighbor, check if any of the history timesteps has a valid flag
     valid = neighbors[:, :, :, flag_idx].sum(axis=2) > 0  # (N,K)
+    # Count how many valid neighbors each sample has
     counts = valid.sum(axis=1).astype(np.int64)           # (N,)
     hist = np.bincount(counts, minlength=K + 1)           # (K+1,)
 
@@ -45,6 +48,7 @@ def print_neighbor_count_stats(data, flag_idx: int = 6):
     print("==================================\n")
 
 
+# Same as above, but with a histogram plot
 def plot_neighbor_histogram(data, flag_idx: int = 6):
     """
     Grafica histograma de cuántos vecinos válidos hay por sample.
@@ -86,50 +90,59 @@ def rotation_matrix(theta: float) -> np.ndarray:
     return np.array([[c, -s],
                      [s,  c]], dtype=np.float32)
 
-
+# Center the coordinates at 'origin' and optionally rotate by R (2x2 matrix)
 def to_ego_frame(xy: np.ndarray, origin: np.ndarray, R: Optional[np.ndarray]) -> np.ndarray:
     out = xy - origin
     if R is not None:
         out = out @ R.T
     return out
 
-
+# Plot sample i
 def plot_sample(data, i: int, title: str = "", ego_frame: bool = True, rotate: bool = False):
-    ego = data["ego"][i]                     # (8,6)
+    ego       = data["ego"][i]               # (8,6)
     neighbors = data["neighbors"][i]         # (K,8,7)
-    gt = data["gt_future_states"][i]         # (K+1,12,6)
+    # Ego is always the first "agent" in gt, neighbors are the next K agents.
+    gt        = data["gt_future_states"][i]  # (K+1,12,6)
 
-    K = neighbors.shape[0]
+    K       = neighbors.shape[0]
     obs_len = ego.shape[0]
-    c = obs_len - 1
+    c       = obs_len - 1
 
+    # Observations of the ego (obs_len,2)
     ego_obs_xy = ego[:, 0:2]
-    ego_gt_xy = gt[0, :, 0:2]
+    # GT future states of the ego (pred_len,2)
+    ego_gt_xy  = gt[0,:, 0:2]
 
-    neigh_valid = neighbors[:, :, 6].sum(axis=1) > 0
+    # Valid neighbors: those that have at least one valid flag in their history
+    neigh_valid  = neighbors[:, :, 6].sum(axis=1) > 0
+    # Observations of the neighbors (K, obs_len, 2)
     neigh_obs_xy = neighbors[:, :, 0:2]
-    neigh_gt_xy = gt[1:, :, 0:2]
+    # GT future states of the neighbors (K, pred_len, 2)
+    neigh_gt_xy  = gt[1:, :, 0:2]
 
     origin = ego_obs_xy[c].copy()
-    R = None
+    R      = None
 
     if ego_frame and rotate:
         if c >= 1:
+            # Compute the velocity vector from the last two observed positions of the ego
             v = ego_obs_xy[c] - ego_obs_xy[c - 1]
         else:
             v = ego_gt_xy[0] - ego_obs_xy[c]
 
         norm = np.linalg.norm(v)
         if norm > 1e-6:
-            v = v / norm
+            v     = v / norm
+            # Minus polar angle to rotate the velocity vector to align with +X axis
             theta = -np.arctan2(v[1], v[0])
-            R = rotation_matrix(theta)
+            R     = rotation_matrix(theta)
 
     if ego_frame:
-        ego_obs_xy = to_ego_frame(ego_obs_xy, origin, R)
-        ego_gt_xy = to_ego_frame(ego_gt_xy, origin, R)
+        # Transforms ego/neighbors (both obs and gt) to ego-centered coordinates.
+        ego_obs_xy   = to_ego_frame(ego_obs_xy, origin, R)
+        ego_gt_xy    = to_ego_frame(ego_gt_xy, origin, R)
         neigh_obs_xy = to_ego_frame(neigh_obs_xy, origin, R)
-        neigh_gt_xy = to_ego_frame(neigh_gt_xy, origin, R)
+        neigh_gt_xy  = to_ego_frame(neigh_gt_xy, origin, R)
 
     plt.figure(figsize=(15, 15), dpi=120)
     ax = plt.gca()
@@ -154,7 +167,7 @@ def plot_sample(data, i: int, title: str = "", ego_frame: bool = True, rotate: b
     )
     ax.add_patch(circle)
 
-    # Vecinos
+    # Plot neighbors
     n_plotted = 0
     for k in range(K):
         if not neigh_valid[k]:
