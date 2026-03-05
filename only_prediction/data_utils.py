@@ -11,7 +11,7 @@ class TrajectoryDataset(Dataset):
         
         self.observed = torch.FloatTensor(data['observed_trajectory'])
         self.future = torch.FloatTensor(data['gt_future_trajectory'])
-        
+        print(self.observed.shape, self.future.shape)
         print(f"  - Loaded {len(self.observed)} test samples")
         print(f"  - Observed shape: {self.observed.shape}")
         print(f"  - Future shape: {self.future.shape}")

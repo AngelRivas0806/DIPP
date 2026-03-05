@@ -198,7 +198,7 @@ class Predictor(nn.Module):
         neighbor_last = neighbors[:, :, -1, :]             # (B, N, feat_dim)
         neighbor_mask = (neighbor_last.sum(dim=-1) == 0)   # (B, N)  True = padding
         actor_mask = torch.cat([ego_mask, neighbor_mask], dim=1)  # (B, 1+N)
-        agent_agent = self.agent_agent(actors, actor_mask)
+        #agent_agent = self.agent_agent(actors, actor_mask)
         agent_agent = self.agent_agent(actors, actor_mask)
         ego_modes = agent_agent[:, :, 0, :]  
         plans, cost_function_weights = self.plan(ego_modes, None)

@@ -269,11 +269,13 @@ class ETHUCYProcessor:
         print(f"  - Peatones únicos: {df['ped_id'].nunique()}")
         print(f"  - Rango frames: {df['frame'].min()} - {df['frame'].max()}\n")
         
-        all_ped_ids = df['ped_id'].unique()
-        all_samples = []
-        skipped_count = 0
+        # Obtener todos los ids de peatones
+        all_ped_ids  = df['ped_id'].unique()
+        all_samples  = []
+        skipped_count= 0
         
         for ped_id in tqdm(all_ped_ids, desc="Procesando peatones"):
+            # Frames donde aparece este peatón
             ped_frames = df[df['ped_id'] == ped_id]['frame'].values
             
             min_frame = ped_frames.min() + (self.obs_len - 1) * frame_step
@@ -286,7 +288,7 @@ class ETHUCYProcessor:
                     continue
                 
                 start_frame = center_frame - (self.obs_len - 1) * frame_step
-                end_frame = center_frame + (self.pred_len + 1) * frame_step
+                end_frame   = center_frame + (self.pred_len + 1) * frame_step
                 
                 # Get full trajectory
                 full_traj = self.get_trajectory(df, ped_id, start_frame, end_frame, frame_step)
@@ -300,7 +302,7 @@ class ETHUCYProcessor:
                 
                 # Split into observed and future
                 observed = positions[:self.obs_len]  # shape: (8, 2)
-                future = positions[self.obs_len:]    # shape: (12, 2)
+                future   = positions[self.obs_len:]    # shape: (12, 2)
                 
                 all_samples.append({
                     'observed': observed.astype(np.float32),
@@ -312,7 +314,7 @@ class ETHUCYProcessor:
         print(f"  - Muestras creadas: {len(all_samples)}")
         print(f"  - Muestras omitidas: {skipped_count}")
         print(f"{'='*60}\n")
-        
+
         return all_samples
     
     def process_dataset_with_ego_consolidated(self, csv_path, frame_step=10):
@@ -604,7 +606,7 @@ def process_all_datasets(datasets_dir, output_base_dir, leave_out=None, split=Fa
         # Convert to numpy arrays
         train_observed = np.array([s['observed'] for s in all_train_samples], dtype=np.float32)
         train_future = np.array([s['future'] for s in all_train_samples], dtype=np.float32)
-        
+        print(train_observed.shape, train_future.shape)
         # Split into train/val if requested
         if split:
             print(f"{'='*60}")
