@@ -75,7 +75,7 @@ If you are realizing the train without planning so you must use the flag --use_p
 python DIPP_model/test_eth_ucy.py \
   --model_path DIPP_model/training_log/Exp1_plan/model_10_0.2293.pth \
   --name Exp1_plan_vis \
-  --test_set DIPP_model/data/val/data.npz \
+  --test_set DIPP_model/data/test/data.npz \
   --device cuda \
   --use_planning \
   --min_neighbors 5

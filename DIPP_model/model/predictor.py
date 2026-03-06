@@ -13,12 +13,15 @@ NUM_MODES = 20
 class AgentEncoder(nn.Module):
     def __init__(self):
         super(AgentEncoder, self).__init__()
-        self.motion = nn.LSTM(6, 256, 2, batch_first=True)
+        self.embedding = nn.Linear(6, 16)  
+        self.motion = nn.LSTM(16, 256, 2, batch_first=True)
     # return the last hidden state as the encoded feature, a tensor of shape (batch_size, 256).
     def forward(self, inputs):
-        traj, _ = self.motion(inputs[:, :, :6])
+        # Apply ReLU activation to the embedded features before feeding them into the LSTM
+        embedded = nn.LeakyReLU()(self.embedding(inputs[:, :, :6]))
+        traj, _ = self.motion(embedded)
+        # Size of traj: (batch_size, seq_len, 256)
         output = traj[:, -1]
-
         return output
 
 
@@ -159,15 +162,15 @@ class Score(nn.Module):
 class Predictor(nn.Module):
     def __init__(self, future_steps, num_neighbors=10, num_modes=NUM_MODES):
         super(Predictor, self).__init__()
-        self._future_steps = future_steps
+        self._future_steps  = future_steps
         self._num_neighbors = num_neighbors
-        self._num_modes = num_modes
+        self._num_modes     = num_modes
 
         self.pedestrian_net = AgentEncoder()    # historia → embedding 256
-        self.agent_agent = Agent2Agent(modes=num_modes)
-        self.plan = AVDecoder(future_steps=self._future_steps, num_modes=num_modes)
-        self.predict = AgentDecoder(future_steps=self._future_steps, num_neighbors=num_neighbors, num_modes=num_modes)
-        self.score = Score(num_modes=num_modes)
+        self.agent_agent    = Agent2Agent(modes=num_modes)
+        self.plan           = AVDecoder(future_steps=self._future_steps, num_modes=num_modes)
+        self.predict        = AgentDecoder(future_steps=self._future_steps, num_neighbors=num_neighbors, num_modes=num_modes)
+        self.score          = Score(num_modes=num_modes)
 
     def forward(self, ego, neighbors):
         """
