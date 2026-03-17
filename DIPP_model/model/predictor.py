@@ -73,71 +73,82 @@ class Agent2Agent(nn.Module):
 """Decoders"""
 
 class AgentDecoder(nn.Module):
-    def __init__(self, future_steps, num_neighbors=10, num_modes=NUM_MODES):
+    def __init__(self, future_steps, num_neighbors=10, num_modes=NUM_MODES, predict_positions=False):
         super(AgentDecoder, self).__init__()
         self._future_steps = future_steps 
         self._num_neighbors = num_neighbors
         self._num_modes = num_modes
+        self._predict_positions = predict_positions
         # Output only 2 values (vx, vy) per step
         self.decode = nn.Sequential(nn.Dropout(0.1), nn.Linear(256, 256), nn.ELU(), nn.Linear(256, future_steps*2))
 
     def transform(self, prediction, current_state, dt: float = 0.4):
-        x = current_state[:, 0]  # (B,)
-        y = current_state[:, 1]  # (B,)
+        """
+        prediction:    (B, M, N, T, 2)
+        current_state: (B, N, feat)     — [x, y, ...]
 
-        vx = prediction[:, :, 0]  # (B, T)
-        vy = prediction[:, :, 1]  # (B, T)
+        predict_positions=False → predicción = (vx, vy) velocidades → dx=vx*dt → integra con cumsum
+        predict_positions=True  → predicción = (x, y) posiciones absolutas → sin integración
+        """
+        if self._predict_positions:
+            # La red predice posiciones absolutas directamente
+            return prediction  # (B, M, N, T, 2)
 
-        # Integrar velocidades → posiciones acumuladas
-        new_x = x.unsqueeze(1) + torch.cumsum(vx * dt, dim=1)
-        new_y = y.unsqueeze(1) + torch.cumsum(vy * dt, dim=1)
+        # La red predice (vx, vy) velocidades → integrar desde posición actual
+        x0 = current_state[:, :, 0]  # (B, N)
+        y0 = current_state[:, :, 1]  # (B, N)
 
-        # Output: [x, y]
-        traj = torch.stack([new_x, new_y], dim=-1)
+        vx = prediction[:, :, :, :, 0]  # (B, M, N, T)
+        vy = prediction[:, :, :, :, 1]
 
-        return traj
-       
+        new_x = x0[:, None, :, None] + torch.cumsum(vx * dt, dim=-1)  # (B, M, N, T)
+        new_y = y0[:, None, :, None] + torch.cumsum(vy * dt, dim=-1)
+
+        return torch.stack([new_x, new_y], dim=-1)  # (B, M, N, T, 2)
+
     def forward(self, agent_agent, current_state):
-        # View as [..., future_steps, 2] 
-        decoded = self.decode(agent_agent).view(-1, self._num_modes, self._num_neighbors, self._future_steps, 2)
-        trajs = torch.stack([self.transform(decoded[:, i, j], current_state[:, j]) for i in range(self._num_modes) for j in range(self._num_neighbors)], dim=1)
-        trajs = torch.reshape(trajs, (-1, self._num_modes, self._num_neighbors, self._future_steps, 2))
-
+        B = agent_agent.shape[0]
+        # decoded: (B, M, N, T, 2)
+        decoded = self.decode(agent_agent).view(B, self._num_modes, self._num_neighbors, self._future_steps, 2)
+        trajs = self.transform(decoded, current_state)  # (B, M, N, T, 2)
         return trajs
 
 
 
 class AVDecoder(nn.Module):
-    def __init__(self, future_steps=12, num_modes=NUM_MODES):
+    def __init__(self, future_steps=12, num_modes=NUM_MODES, num_cost_weights=5):
         super(AVDecoder, self).__init__()
         self._future_steps = future_steps
         self._num_modes = num_modes
+        self._num_cost_weights = num_cost_weights
+
         # Output control variables (acceleration and direction change) instead of trajectories
         self.control = nn.Sequential(nn.Dropout(0.1), nn.Linear(256, 256), nn.ELU(), nn.Linear(256, future_steps*2))
-        
-        # 6 cost weights learnable (one per cost term)
-        self.cost_weights = nn.Parameter(torch.ones(6, dtype=torch.float32))
 
-        self.register_buffer('scale', torch.tensor([
-            0.5,   # weight[0]: acceleration
-            0.1,   # weight[1]: jerk
-            0.1,   # weight[2]: steering
-            0.1,   # weight[3]: steering_change
-            5.0,   # weight[4]: collision_avoidance
-            2.0,   # weight[5]: trajectory_following
-        ], dtype=torch.float32))
+        # MLP que genera los pesos de la función de costo a partir de un dummy input fijo
+        # Entrada dummy = tensor de unos de tamaño (1, 1) → se aprende qué pesos usar
+        self.cost_mlp = nn.Sequential(
+            nn.Linear(1, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_cost_weights)
+        )
 
-    def forward(self, agent_agent, current_state):
+        # Dummy input fijo (no es parámetro, solo valor constante de relleno)
+        self.register_buffer('dummy_input', torch.ones(1, 1, dtype=torch.float32))
+
+    def forward(self, agent_agent):
+        B = agent_agent.shape[0]
+
         # Generate control variables for num_modes modes
         actions = self.control(agent_agent).view(-1, self._num_modes, self._future_steps, 2)
 
-        # Generate cost function weights (all learnable, scaled for pedestrians)
-        norm_weights = torch.softmax(self.cost_weights, dim=0)  # (6,)
-        scaled_weights = norm_weights * self.scale  # (6,)
-        
-        # Expand to batch dimension for compatibility
-        cost_function_weights = scaled_weights.unsqueeze(0).expand(actions.shape[0], -1)  # (B, 6)
-
+        # cost_weights: generados por MLP desde dummy input fijo
+        # El MLP aprende qué pesos son óptimos durante el entrenamiento
+        raw_weights = self.cost_mlp(self.dummy_input)           # (1, num_cost_weights)
+        positive_weights = F.softplus(raw_weights)              # garantizar positividad
+        cost_function_weights = positive_weights.expand(B, -1).contiguous()  # (B, num_cost_weights)
 
         return actions, cost_function_weights
 
@@ -160,7 +171,7 @@ class Score(nn.Module):
 
 
 class Predictor(nn.Module):
-    def __init__(self, future_steps, num_neighbors=10, num_modes=NUM_MODES):
+    def __init__(self, future_steps, num_neighbors=10, num_modes=NUM_MODES, predict_positions=False):
         super(Predictor, self).__init__()
         self._future_steps  = future_steps
         self._num_neighbors = num_neighbors
@@ -169,7 +180,7 @@ class Predictor(nn.Module):
         self.pedestrian_net = AgentEncoder()    # historia → embedding 256
         self.agent_agent    = Agent2Agent(modes=num_modes)
         self.plan           = AVDecoder(future_steps=self._future_steps, num_modes=num_modes)
-        self.predict        = AgentDecoder(future_steps=self._future_steps, num_neighbors=num_neighbors, num_modes=num_modes)
+        self.predict        = AgentDecoder(future_steps=self._future_steps, num_neighbors=num_neighbors, num_modes=num_modes, predict_positions=predict_positions)
         self.score          = Score(num_modes=num_modes)
 
     def forward(self, ego, neighbors):
@@ -190,12 +201,12 @@ class Predictor(nn.Module):
 
         ego_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)  # (B,1)
         neighbor_last = neighbors[:, :, -1, :]             # (B, N, feat_dim)
-        neighbor_mask = (neighbor_last.sum(dim=-1) == 0)   # (B, N)  True = padding
+        neighbor_mask = (neighbor_last[:, :, 6] == 0)      # (B, N)  True = ausente (flag==0)
         actor_mask = torch.cat([ego_mask, neighbor_mask], dim=1)  # (B, 1+N)
         #agent_agent = self.agent_agent(actors, actor_mask)
         agent_agent = self.agent_agent(actors, actor_mask)
         ego_modes = agent_agent[:, :, 0, :]  
-        plans, cost_function_weights = self.plan(ego_modes, None)
+        plans, cost_function_weights = self.plan(ego_modes)
         current_state_neighbors = neighbors[:, :, -1, :]
 
         # agent_agent[:, :, 1:] → (B, num_modes, num_neighbors, 256)

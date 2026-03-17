@@ -64,44 +64,67 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
         )
 
         # pérdida multi-futuro multi-agente
-        loss = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights)
-        if isinstance(loss, (tuple, list)):
-             loss = loss[0]
+        # ego_in_pred_loss=False cuando use_planning: el ego se supervisa via imitation_loss sobre plan optimizado
+        _, pred_loss, score_loss, best_mode = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights,
+                                                         ego_in_pred_loss=not use_planning)
+
+        # imitacion: ego del modo ganador vs gt — suma
+        best_plan = plan_trajs[torch.arange(plan_trajs.shape[0], device=plan_trajs.device), best_mode]
+        imitation_loss = F.smooth_l1_loss(best_plan[:, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
+
+        # sin planning: loss base, cost_weights NO se usan aqui
+        loss = args.lambda_pred * pred_loss + args.lambda_score * score_loss + args.lambda_imitation * imitation_loss
 
         # plan
         if use_planning:
             # selecciona el modo ganador para iniciar el optimizador
             plan, prediction = select_future(plans, predictions, scores)
 
-            # Ground truth trajectory para tracking (ego)
-            gt_trajectory = ground_truth[:, 0, :, :2]  # (B, 12, 2)  solo x,y
-
             planner_inputs = {
                 "control_variables": plan.view(ego.shape[0], 24),
                 "predictions": prediction,
                 "current_state": current_state,
-                "gt_trajectory": gt_trajectory
             }
 
-            # pasa cost weights al planner (variables theseus)
-            w = cost_function_weights  # (B, 6)
+            w = cost_function_weights  # (B, 5)
 
-            planner_inputs["w_acc"] = w[:, 0].unsqueeze(1)
-            planner_inputs["w_jerk"] = w[:, 1].unsqueeze(1)
-            planner_inputs["w_steer"] = w[:, 2].unsqueeze(1)
+            planner_inputs["w_acc"]          = w[:, 0].unsqueeze(1)
+            planner_inputs["w_jerk"]         = w[:, 1].unsqueeze(1)
+            planner_inputs["w_steer"]        = w[:, 2].unsqueeze(1)
             planner_inputs["w_steer_change"] = w[:, 3].unsqueeze(1)
-            planner_inputs["w_collision"] = w[:, 4].unsqueeze(1)
-            planner_inputs["w_tracking"] = w[:, 5].unsqueeze(1)
+            planner_inputs["w_collision"]    = w[:, 4].unsqueeze(1)
 
             final_values, info = planner.layer.forward(planner_inputs)
-            plan = final_values["control_variables"].view(-1, 12, 2)
-            plan = bicycle_model(plan, ego[:, -1])[:, :, :3]
+            u_opt = final_values["control_variables"].view(-1, 12, 2)
+            plan  = bicycle_model(u_opt, ego[:, -1])[:, :, :3]
+
+            # Calcular cada residuo en PyTorch para que el gradiente llegue a cost_weights
+            dt = 0.4
+            w_acc          = w[:, 0].mean()
+            w_jerk         = w[:, 1].mean()
+            w_steer        = w[:, 2].mean()
+            w_steer_change = w[:, 3].mean()
+            w_col          = w[:, 4].mean()
+
+            acc    = u_opt[:, :, 0]                            # (B, T)
+            jerk   = torch.diff(acc,   dim=1) / dt            # (B, T-1)
+            steer  = u_opt[:, :, 1]                           # (B, T)
+            ds     = torch.diff(steer, dim=1) / dt            # (B, T-1)
+
+            cost_reg = (w_acc   * acc.pow(2).mean()
+                      + w_jerk  * jerk.pow(2).mean()
+                      + w_steer * steer.pow(2).mean()
+                      + w_steer_change * ds.pow(2).mean())
+
+            # imitacion sobre plan optimizado — suma
+            imitation_loss = F.smooth_l1_loss(plan[:, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
 
             plan_cost = info.last_err.mean() if hasattr(info, "last_err") else 0
-            plan_loss = F.smooth_l1_loss(plan[:, :, :2], ground_truth[:, 0, :, :2])
-            plan_loss += F.smooth_l1_loss(plan[:, -1, :2], ground_truth[:, 0, -1, :2])
 
-            loss = loss + plan_loss + 1e-3 * plan_cost
+            loss = (args.lambda_pred * pred_loss
+                    + args.lambda_score * score_loss
+                    + args.lambda_imitation * imitation_loss
+                    + args.lambda_cost * (cost_reg + w_col * plan_cost))
         else:
             plan, prediction = select_future(plan_trajs, predictions, scores)
 
@@ -158,40 +181,45 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
                 [bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(NUM_MODES)],
                 dim=1
             )
-            loss = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights)
-            if isinstance(loss, (tuple, list)):
-                loss = loss[0]
+            # ego_in_pred_loss=False cuando use_planning: el ego se supervisa via imitation_loss sobre plan optimizado
+            _, pred_loss, score_loss, best_mode = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights,
+                                                             ego_in_pred_loss=not use_planning)
+
+            best_plan = plan_trajs[torch.arange(plan_trajs.shape[0], device=plan_trajs.device), best_mode]
+            imitation_loss = F.smooth_l1_loss(best_plan[:, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
+
+            loss = args.lambda_pred * pred_loss + args.lambda_score * score_loss + args.lambda_imitation * imitation_loss
+
         if use_planning:
             plan, prediction = select_future(plans, predictions, scores)
-            gt_trajectory = ground_truth[:, 0, :, :2]  # (B, 12, 2)  solo x,y
 
             planner_inputs = {
                 "control_variables": plan.view(ego.shape[0], 24),
                 "predictions": prediction,
                 "current_state": current_state,
-                "gt_trajectory": gt_trajectory
             }
 
-            w = cost_function_weights  # (B, 6)
+            w = cost_function_weights  # (B, 5)
 
-            planner_inputs["w_acc"] = w[:, 0].unsqueeze(1)
-            planner_inputs["w_jerk"] = w[:, 1].unsqueeze(1)
-            planner_inputs["w_steer"] = w[:, 2].unsqueeze(1)
+            planner_inputs["w_acc"]          = w[:, 0].unsqueeze(1)
+            planner_inputs["w_jerk"]         = w[:, 1].unsqueeze(1)
+            planner_inputs["w_steer"]        = w[:, 2].unsqueeze(1)
             planner_inputs["w_steer_change"] = w[:, 3].unsqueeze(1)
-            planner_inputs["w_collision"] = w[:, 4].unsqueeze(1)
-            planner_inputs["w_tracking"] = w[:, 5].unsqueeze(1)
+            planner_inputs["w_collision"]    = w[:, 4].unsqueeze(1)
 
             with torch.no_grad():
                 final_values, info = planner.layer.forward(planner_inputs)
 
-            plan = final_values["control_variables"].view(-1, 12, 2)
-            plan = bicycle_model(plan, ego[:, -1])[:, :, :3]
+            u_opt = final_values["control_variables"].view(-1, 12, 2)
+            plan  = bicycle_model(u_opt, ego[:, -1])[:, :, :3]
 
-            plan_cost = info.last_err.mean() if hasattr(info, "last_err") else 0
-            plan_loss = F.smooth_l1_loss(plan[:, :, :2], ground_truth[:, 0, :, :2])
-            plan_loss += F.smooth_l1_loss(plan[:, -1, :2], ground_truth[:, 0, -1, :2])
+            plan_cost      = info.last_err.mean() if hasattr(info, "last_err") else 0
+            imitation_loss = F.smooth_l1_loss(plan[:, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
 
-            loss = loss + plan_loss + 1e-3 * plan_cost
+            loss = (args.lambda_pred * pred_loss
+                    + args.lambda_score * score_loss
+                    + args.lambda_imitation * imitation_loss
+                    + args.lambda_cost * plan_cost)
         else:
             plan, prediction = select_future(plan_trajs, predictions, scores)
 
@@ -236,7 +264,7 @@ def model_training():
     set_seed(args.seed)
 
     # predictor
-    predictor = Predictor(12).to(args.device)
+    predictor = Predictor(12, predict_positions=args.predict_positions).to(args.device)
 
     # planner
     if args.use_planning:
@@ -247,7 +275,7 @@ def model_training():
 
     # optimizer
     optimizer = optim.Adam(predictor.parameters(), lr=args.learning_rate)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.98)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=.98)
 
     train_epochs = args.train_epochs
     batch_size = args.batch_size
@@ -353,7 +381,7 @@ if __name__ == "__main__":
     parser.add_argument("--valid_set", type=str, help="path to validation datasets", required=True)
     parser.add_argument("--seed", type=int, help="fix random seed", default=42)
     parser.add_argument("--num_workers", type=int, default=8, help="number of workers used for dataloader")
-    parser.add_argument("--pretrain_epochs", type=int, help="epochs of pretraining predictor", default=10)
+    parser.add_argument("--pretrain_epochs", type=int, help="epochs of pretraining predictor", default=5)
     parser.add_argument("--train_epochs", type=int, help="epochs of training", default=20)
     parser.add_argument("--batch_size", type=int, help="batch size (default: 32)", default=32)
     parser.add_argument("--learning_rate", type=float, help="learning rate (default: 2e-4)", default=2e-4)
@@ -364,6 +392,11 @@ if __name__ == "__main__":
         default=False,
     )
     parser.add_argument("--device", type=str, help="run on which device (default: cuda)", default="cuda")
+    parser.add_argument("--lambda_pred",       type=float, default=0.7,  help="peso perdida de prediccion")
+    parser.add_argument("--lambda_score",      type=float, default=1.0,  help="peso perdida de score")
+    parser.add_argument("--lambda_imitation",  type=float, default=1.0,  help="peso perdida de imitacion")
+    parser.add_argument("--lambda_cost",       type=float, default=1e-2, help="peso del costo Theseus (solo con planning)")
+    parser.add_argument("--predict_positions", action="store_true", help="predecir posiciones (x,y) absolutas en vez de desplazamientos (dx,dy) para vecinos")
     args = parser.parse_args()
 
     if args.device.startswith("cuda") and torch.cuda.is_available():

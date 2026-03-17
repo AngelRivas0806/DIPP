@@ -34,7 +34,7 @@ def set_seed(CUR_SEED: int):
 # =========================================================
 class DrivingData(Dataset):
     """
-    Dataset simplificado para ego-only consolidado.
+    Dataset
 
     Espera un .npz con keys:
       - ego:             (N, obs_len, 6)          [x,y,vx,vy,ax,ay]
@@ -202,7 +202,7 @@ def _neighbor_presence_mask_from_weights(weights: torch.Tensor, N: int, T: int, 
 # =========================================================
 # Loss + Selection
 # =========================================================
-def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Optional[torch.Tensor] = None):
+def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Optional[torch.Tensor] = None, ego_in_pred_loss: bool = True):
     B, M, T, _ = plans.shape
     _, _, N, _, _ = predictions.shape
 
@@ -213,28 +213,26 @@ def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Opti
     predictions_masked = predictions * neigh_any[:, None].float()
 
     if best_mode is None:
-        # ---- Pérdida conjunta por modo: ego + vecinos promediados
-        # Ego: (B, M)
+        # ---- Selección best_mode: suma de errores por modo (sin promediar)
+
+        # Ego: suma sobre T y xy → (B, M)
         ego_loss_per_mode = F.smooth_l1_loss(
-            plans[:, :, :, :2],                          # (B, M, T, 2)
-            ground_truth[:, None, 0, :, :2].expand(-1, M, -1, -1),  # (B, M, T, 2)
+            plans[:, :, :, :2],
+            ground_truth[:, None, 0, :, :2].expand(-1, M, -1, -1),
             reduction='none'
-        ).mean(dim=[-1, -2])  # (B, M)
+        ).sum(dim=[-1, -2])  # (B, M)
 
-        # Vecinos: (B, M, N, T, 2) → (B, M)
+        # Vecinos: suma sobre xy → (B, M, N, T), luego suma sobre N y T enmascarando ausentes → (B, M)
         nei_loss_per_mode = F.smooth_l1_loss(
-            predictions_masked[:, :, :, :, :2],          # (B, M, N, T, 2)
-            ground_truth[:, None, 1:, :, :2].expand(-1, M, -1, -1, -1),  # (B, M, N, T, 2)
+            predictions_masked[:, :, :, :, :2],
+            ground_truth[:, None, 1:, :, :2].expand(-1, M, -1, -1, -1),
             reduction='none'
-        ).mean(dim=-1)  # (B, M, N, T)
+        ).sum(dim=-1)  # (B, M, N, T)
 
-        # Enmascarar vecinos ausentes y promediar
-        nei_loss_per_mode = (nei_loss_per_mode * neigh_mask[:, None, :, :, 0].float()).sum(dim=[-1, -2])  # (B, M, N) → (B, M)
-        n_valid = neigh_any[:, :, 0, 0].float().sum(dim=1, keepdim=True).clamp_min(1.0)  # (B, 1)
-        nei_loss_per_mode = nei_loss_per_mode / n_valid  # (B, M)
+        nei_loss_per_mode = (nei_loss_per_mode * neigh_mask[:, None, :, :, 0].float()).sum(dim=[-1, -2])  # (B, M)
 
-        # Pérdida conjunta: promedio ego + vecinos por modo
-        joint_loss_per_mode = (ego_loss_per_mode + nei_loss_per_mode) / (1 + n_valid)  # (B, M)
+        # Suma conjunta: ego + vecinos (sin normalizar)
+        joint_loss_per_mode = ego_loss_per_mode + nei_loss_per_mode  # (B, M)
         best_mode = torch.argmin(joint_loss_per_mode, dim=-1)  # (B,)
 
     score_loss = F.cross_entropy(scores, best_mode)
@@ -247,26 +245,24 @@ def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Opti
     best_mode_pred_3d = torch.cat([best_mode_pred, dummy_theta], dim=-1)
     prediction_all = torch.cat([best_mode_plan.unsqueeze(1), best_mode_pred_3d], dim=1)  # (B,1+N,T,3)
 
-    # ---- Loss sobre modo ganador
-    pred_loss = 0.0
+    # ---- pred_loss sobre modo ganador: suma de errores (sin promediar)
 
-    # Ego
-    pred_loss = pred_loss + F.smooth_l1_loss(prediction_all[:, 0, :, :2], ground_truth[:, 0, :, :2])
-    pred_loss = pred_loss + F.smooth_l1_loss(prediction_all[:, 0, -1, :2], ground_truth[:, 0, -1, :2])
+    # Ego: solo si ego_in_pred_loss=True (con planning se supervisa vía imitation_loss)
+    if ego_in_pred_loss:
+        ego_l = F.smooth_l1_loss(prediction_all[:, 0, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
+    else:
+        ego_l = torch.tensor(0.0, device=plans.device)
+    pred_loss = ego_l
 
-    # Vecinos enmascarados
+    # Vecinos: suma sobre xy, T y vecinos presentes (sin dividir)
     gt_nei_xy   = ground_truth[:, 1:, :, :2]
     pred_nei_xy = prediction_all[:, 1:, :, :2]
-    nei_l = F.smooth_l1_loss(pred_nei_xy, gt_nei_xy, reduction='none').mean(dim=-1, keepdim=True)
-    nei_l = (nei_l * neigh_mask.float()).sum() / neigh_mask.float().sum().clamp_min(1.0)
+    nei_l = F.smooth_l1_loss(pred_nei_xy, gt_nei_xy, reduction='none').sum(dim=-1, keepdim=True)  # (B,N,T,1)
+    nei_l = (nei_l * neigh_mask.float()).sum()  # escalar: suma total
     pred_loss = pred_loss + nei_l
 
-    nei_last = F.smooth_l1_loss(pred_nei_xy[:, :, -1, :], gt_nei_xy[:, :, -1, :], reduction='none').mean(dim=-1, keepdim=True)
-    nei_last = (nei_last * neigh_any.squeeze(-1).float()).sum() / neigh_any.squeeze(-1).float().sum().clamp_min(1.0)
-    pred_loss = pred_loss + nei_last
-
     total = 0.5 * pred_loss + score_loss
-    return total, best_mode
+    return total, pred_loss, score_loss, best_mode
 
 
 def select_future(plans, predictions, scores, best_mode: Optional[torch.Tensor] = None):
@@ -355,84 +351,67 @@ def project_to_cartesian_frame(traj, ref_line):
 # =========================================================
 def bicycle_model(control, current_state):
     """
-    Modelo cinemático adaptado para peatones
-    Para datos de peatones: current_state = [x, y, vx, vy, ax, ay, 0, 0]
+    Modelo cinemático de vehículo (bicycle model).
+    current_state: (B, 6) = [x, y, vx, vy, ax, ay]  ← formato ego del dataset
+                   (B, 4) = [x, y, theta, v]          ← formato compacto (fallback)
+    control:       (B, T, 2) = [accel, steering]
     """
-    dt = 0.4  # 2.5 fps -> 0.4s
+    dt = 0.4  # 0.4s por frame
+    max_delta = 0.6
+    max_a = 5.0
+    L = 3.089  # wheelbase (robot/vehículo)
 
-    x_0 = current_state[:, 0]
-    y_0 = current_state[:, 1]
+    x_0     = current_state[:, 0]
+    y_0     = current_state[:, 1]
 
-    # Si hay vx,vy: modo peatón (punto-masa)
-    if current_state.shape[1] >= 4:
-        vx_0 = current_state[:, 2]
-        vy_0 = current_state[:, 3]
-
-        # control peatón: (ax, ay)
-        ax = control[:, :, 0]
-        ay = control[:, :, 1]
-
-        # integrar velocidades (T)
-        vx = vx_0.unsqueeze(1) + torch.cumsum(ax * dt, dim=1)
-        vy = vy_0.unsqueeze(1) + torch.cumsum(ay * dt, dim=1)
-
-        # integrar posiciones (T)
-        x = x_0.unsqueeze(1) + torch.cumsum(vx * dt, dim=1)
-        y = y_0.unsqueeze(1) + torch.cumsum(vy * dt, dim=1)
-
-        theta = torch.atan2(vy, vx)
-        v = torch.hypot(vx, vy)
-
-        traj = torch.stack([x, y, theta, v], dim=-1)
-
+    if current_state.shape[1] >= 6:
+        # Formato ego del dataset: [x, y, vx, vy, ax, ay]
+        # En el frame ego-centrado: vx > 0, vy ≈ 0, theta ≈ 0
+        vx_0    = current_state[:, 2]
+        vy_0    = current_state[:, 3]
+        theta_0 = torch.atan2(vy_0, vx_0)                          # (B,) heading inicial
+        v_0     = torch.hypot(vx_0, vy_0)                          # (B,) velocidad inicial
     else:
-        # Modo vehículo (fallback)
-        max_delta = 0.6
-        max_a = 5
-        L = 3.089
-
+        # Formato compacto: [x, y, theta, v]
         theta_0 = current_state[:, 2]
-        # Si solo trae v en idx 3:
-        v_0 = current_state[:, 3]
+        v_0     = current_state[:, 3]
 
-        a = control[:, :, 0].clamp(-max_a, max_a)
-        delta = control[:, :, 1].clamp(-max_delta, max_delta)
+    a     = control[:, :, 0].clamp(-max_a, max_a)                  # (B, T)
+    delta = control[:, :, 1].clamp(-max_delta, max_delta)          # (B, T)
 
-        v = torch.clamp(v_0.unsqueeze(1) + torch.cumsum(a * dt, dim=1), min=0.0)
+    v = torch.clamp(v_0.unsqueeze(1) + torch.cumsum(a * dt, dim=1), min=0.0)  # (B, T)
 
-        d_theta = v * delta / L
-        theta = torch.fmod(theta_0.unsqueeze(1) + torch.cumsum(d_theta * dt, dim=1), 2 * torch.pi)
+    d_theta = v * delta / L                                         # (B, T)
+    theta   = torch.fmod(theta_0.unsqueeze(1) + torch.cumsum(d_theta * dt, dim=1), 2 * torch.pi)  # (B, T)
 
-        x = x_0.unsqueeze(1) + torch.cumsum(v * torch.cos(theta) * dt, dim=1)
-        y = y_0.unsqueeze(1) + torch.cumsum(v * torch.sin(theta) * dt, dim=1)
+    x = x_0.unsqueeze(1) + torch.cumsum(v * torch.cos(theta) * dt, dim=1)  # (B, T)
+    y = y_0.unsqueeze(1) + torch.cumsum(v * torch.sin(theta) * dt, dim=1)  # (B, T)
 
-        traj = torch.stack([x, y, theta, v], dim=-1)
-
-    return traj
+    return torch.stack([x, y, theta, v], dim=-1)  # (B, T, 4)
 
 
-def physical_model(control, current_state, dt=0.1):
-    """
-    Modelo físico simple (vehículo).
-    FIX: respeta el dt que se pasa como argumento.
-    """
-    max_d_theta = 0.5
-    max_a = 5
+# def physical_model(control, current_state, dt=0.1):
+#     """
+#     Modelo físico simple (vehículo).
+#     FIX: respeta el dt que se pasa como argumento.
+#     """
+#     max_d_theta = 0.5
+#     max_a = 5
 
-    x_0 = current_state[:, 0]
-    y_0 = current_state[:, 1]
-    theta_0 = current_state[:, 2]
-    v_0 = torch.hypot(current_state[:, 3], current_state[:, 4])
+#     x_0 = current_state[:, 0]
+#     y_0 = current_state[:, 1]
+#     theta_0 = current_state[:, 2]
+#     v_0 = torch.hypot(current_state[:, 3], current_state[:, 4])
 
-    a = control[:, :, 0].clamp(-max_a, max_a)
-    d_theta = control[:, :, 1].clamp(-max_d_theta, max_d_theta)
+#     a = control[:, :, 0].clamp(-max_a, max_a)
+#     d_theta = control[:, :, 1].clamp(-max_d_theta, max_d_theta)
 
-    v = torch.clamp(v_0.unsqueeze(1) + torch.cumsum(a * dt, dim=1), min=0.0)
+#     v = torch.clamp(v_0.unsqueeze(1) + torch.cumsum(a * dt, dim=1), min=0.0)
 
-    theta = torch.fmod(theta_0.unsqueeze(1) + torch.cumsum(d_theta * dt, dim=1), 2 * torch.pi)
+#     theta = torch.fmod(theta_0.unsqueeze(1) + torch.cumsum(d_theta * dt, dim=1), 2 * torch.pi)
 
-    x = x_0.unsqueeze(1) + torch.cumsum(v * torch.cos(theta) * dt, dim=1)
-    y = y_0.unsqueeze(1) + torch.cumsum(v * torch.sin(theta) * dt, dim=1)
+#     x = x_0.unsqueeze(1) + torch.cumsum(v * torch.cos(theta) * dt, dim=1)
+#     y = y_0.unsqueeze(1) + torch.cumsum(v * torch.sin(theta) * dt, dim=1)
 
-    traj = torch.stack([x, y, theta, v], dim=-1)
-    return traj
+#     traj = torch.stack([x, y, theta, v], dim=-1)
+#     return traj

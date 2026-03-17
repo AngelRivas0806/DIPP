@@ -123,7 +123,6 @@ def build_objective(
     control_variables: th.Vector,
     current_state: th.Variable,
     predictions: th.Variable,
-    gt_trajectory: th.Variable,
     weights: dict,
     trajectory_len: int,
     dt_var: th.Variable,
@@ -132,8 +131,6 @@ def build_objective(
 ):
     T = trajectory_len
     Tm1 = max(T - 1, 1)
-    halfT = (T + 1) // 2
-    track_dim = 2 * halfT
 
     # Comfort
     objective.add(th.AutoDiffCostFunction(
@@ -162,15 +159,6 @@ def build_objective(
         name="collision_avoidance"
     ))
 
-    # Imitation / Tracking (solo 1 vez)
-    objective.add(th.AutoDiffCostFunction(
-        [control_variables], trajectory_following_residual, track_dim,
-        weights["tracking"],
-        aux_vars=[gt_trajectory, current_state],
-        autograd_vectorize=vectorize,
-        name="trajectory_following"
-    ))
-
     return objective
 
 
@@ -185,7 +173,6 @@ class MotionPlanner:
       - steer
       - steer_change
       - collision
-      - tracking
     """
     def __init__(self, trajectory_len: int, device, test: bool = False, dt: float = 0.1, safety_distance: float = 0.5):
         self.device = torch.device(device)
@@ -197,21 +184,18 @@ class MotionPlanner:
         self.control_variables = th.Vector(dof=trajectory_len * 2, name="control_variables")
         self.predictions = th.Variable(torch.empty(1, 10, trajectory_len, 2), name="predictions")
         self.current_state = th.Variable(torch.empty(1, 11, 6), name="current_state")
-        self.gt_trajectory = th.Variable(torch.empty(1, trajectory_len, 2), name="gt_trajectory")
 
-        # Aux scalars as Variables (so residuals can read them cleanly)
+        # Aux scalars as Variables
         self.dt_var = th.Variable(torch.tensor([dt]), name="dt")
         self.safety_distance_var = th.Variable(torch.tensor([safety_distance]), name="safety_distance")
 
-        # Learnable weights (ScaleCostWeight over Variables)
-        # Nota: si quieres positividad garantizada, te recomiendo parametrizar con softplus en otro lado.
+        # Learnable weights (5 costos, sin tracking)
         self.cost_weights_vars = {
-            "acc": th.Variable(torch.rand(1), name="w_acc"),
-            "jerk": th.Variable(torch.rand(1), name="w_jerk"),
-            "steer": th.Variable(torch.rand(1), name="w_steer"),
+            "acc":          th.Variable(torch.rand(1), name="w_acc"),
+            "jerk":         th.Variable(torch.rand(1), name="w_jerk"),
+            "steer":        th.Variable(torch.rand(1), name="w_steer"),
             "steer_change": th.Variable(torch.rand(1), name="w_steer_change"),
-            "collision": th.Variable(torch.rand(1), name="w_collision"),
-            "tracking": th.Variable(torch.rand(1), name="w_tracking"),
+            "collision":    th.Variable(torch.rand(1), name="w_collision"),
         }
         self.cost_weights = {k: th.ScaleCostWeight(v) for k, v in self.cost_weights_vars.items()}
 
@@ -222,12 +206,11 @@ class MotionPlanner:
             control_variables=self.control_variables,
             current_state=self.current_state,
             predictions=self.predictions,
-            gt_trajectory=self.gt_trajectory,
             weights=self.cost_weights,
             trajectory_len=trajectory_len,
             dt_var=self.dt_var,
             safety_distance_var=self.safety_distance_var,
-            vectorize=False,  # tú estabas usando False, lo dejo igual
+            vectorize=False,
         )
 
         # Optimizer
