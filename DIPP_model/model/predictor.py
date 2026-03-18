@@ -5,25 +5,29 @@ import torch.nn.functional as F
 # Número de modos
 NUM_MODES = 20
 
-"""Agent history encoder
-# Encodes the historical trajectory of a pedestrian using an LSTM network.
-# Mas adelante en la clase Predictor, creamos dos instancias de este encoder, una para los
-# vecinos(comparten pesos)y una para el ego"""
-
+"""
+Agent history encoder
+Encodes the historical trajectory of a pedestrian using an LSTM network.
+In the Predictor class, we create two instances of this encoder (with shared weights),
+one for the neighbors and one for the ego agent.
+"""
 class AgentEncoder(nn.Module):
     def __init__(self, embed_dim):
         super(AgentEncoder, self).__init__()
         self.embed_init= 16
         self.embed_dim = embed_dim
+        # First embedding, before passing to LSTM
         self.embedding = nn.Linear(6,self.embed_init)  
+        # LSTM with 2 layers
         self.motion    = nn.LSTM(self.embed_init, self.embed_dim, 2, batch_first=True)
 
-    # return the last hidden state as the encoded feature, a tensor of shape (batch_size, embed_dim).
+    # Return the last hidden state as the encoded feature (B,E).
     def forward(self, inputs):
-        # Apply ReLU activation to the embedded features before feeding them into the LSTM
-        embedded = nn.LeakyReLU()(self.embedding(inputs[:, :, :6]))
+        # TODO: test different activations here.
+        # Apply GELU activation to the embedded features before feeding them into the LSTM
+        embedded = nn.GELU()(self.embedding(inputs[:, :, :6]))
         traj, _  = self.motion(embedded)
-        # Size of traj: (batch_size, seq_len, embed_dim)
+        # (B,E,T) → (B,E)
         output   = traj[:, -1]
         return output
 
@@ -45,34 +49,36 @@ class MultiModalTransformer(nn.Module):
         return output
 
 
-
+"""
+Agent2Agent
+Module that models the interactions between agents using a transformer encoder.
+"""
 class Agent2Agent(nn.Module):
     def __init__(self, modes: int, tokens_dim: int):
         super(Agent2Agent, self).__init__()
         self.modes = modes
         
         # Encoder to process interactions between agents
+        # TODO: test different numbers of heads, feedforward dimensions, activation functions, number of layers.
         encoder_layer = nn.TransformerEncoderLayer(d_model=tokens_dim, nhead=8, dim_feedforward=1024, activation='relu', batch_first=True)
         self.interaction_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
-
-        # Multi-modal attention to generate multiple interpretations
-        # self.multimodal = MultiModalTransformer(modes=modes, output_dim=512)
         
     def forward(self, inputs, mask=None):
-        # Step 1: Encode basic interactions
+        # Encode basic interactions
         encoded = self.interaction_net(inputs, src_key_padding_mask=mask)
-        # encoded: (batch, num_agents, tokens_dim)
-
-        # Step 2: Generate NUM_MODES modes using self-attention
-        # query = encoded  # (batch, num_agents, tokens_dim)
-        # output = self.multimodal(query, encoded, encoded, mask)
-        # output: (batch, NUM_MODES, num_agents, tokens_dim)
-        output = encoded.unsqueeze(1).expand(-1, self.modes, -1, -1)  # (batch, NUM_MODES, num_agents, tokens_dim)
+        # Expand the encoded features to have a separate version for each mode
+        output = encoded.unsqueeze(1).expand(-1, self.modes, -1, -1)  # (B,M,N,E)
+        if False:
+            # Produce Gaussian noise in size (B,1,N,E) and add it to the output to encourage diversity in the modes
+            noise = torch.randn_like(output[:, :1, :, :]) * 0.1 
+            output= output + noise
         return output
     
 
-"""Decoders"""
-
+"""
+AgentDecoder
+Produces the predicted trajectories for each neighbor agent in each mode.
+"""
 class AgentDecoder(nn.Module):
     def __init__(self, future_steps, token_dims, num_neighbors=10, num_modes=NUM_MODES, predict_positions=False):
         super(AgentDecoder, self).__init__()
@@ -96,17 +102,11 @@ class AgentDecoder(nn.Module):
             return prediction  # (B, M, N, T, 2)
 
         # La red predice (vx, vy) velocidades → integrar desde posición actual
-        x0 = current_state[:, :, 0]  # (B, N)
-        y0 = current_state[:, :, 1]  # (B, N)
-
-        vx = prediction[:, :, :, :, 0]  # (B, M, N, T)
-        vy = prediction[:, :, :, :, 1]
-
-        new_x = x0[:, None, :, None] + torch.cumsum(vx * dt, dim=-1)  # (B, M, N, T)
-        new_y = y0[:, None, :, None] + torch.cumsum(vy * dt, dim=-1)
-
-        return torch.stack([new_x, new_y], dim=-1)  # (B, M, N, T, 2)
-
+        state0 = current_state[:, :, 0:2].unsqueeze(1).unsqueeze(3)  # (B, 1,N,1, 2)
+        v      = prediction[:, :, :, :, :]  # (B, M, N, T, 2)
+        states = state0 + torch.cumsum(v * dt, dim=3)  # (B, M, N, T, 2)
+        return states
+    
     def forward(self, agent_agent, current_state):
         B = agent_agent.shape[0]
         # decoded: (B, M, N, T, 2)
@@ -207,7 +207,7 @@ class Predictor(nn.Module):
         actor_mask = torch.cat([ego_mask, neighbor_mask], dim=1)  # (B, 1+N)
         agent_agent = self.agent_agent_net(actors, actor_mask)
         ego_modes = agent_agent[:, :, 0, :]  
-        plans, cost_function_weights = self.plan_net(ego_modes, None)
+        plans, cost_function_weights = self.plan_net(ego_modes)
         current_state_neighbors = neighbors[:, :, -1, :]
 
         # agent_agent[:, :, 1:] → (B, num_modes, num_neighbors, 256)
