@@ -86,12 +86,16 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
             current_state= torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
 
             # Predicción
-            plans, predictions, scores, cost_function_weights = model(ego, neighbors)
+            plans, delta_predictions, scores, cost_function_weights = model(ego, neighbors)
+            if False:
+                predictions = current_state[:, 1:, :2].unsqueeze(1).unsqueeze(3) + delta_predictions.cumsum(dim=3)  # (B,M,N,T,2)
+            else:
+                predictions = delta_predictions
             # Generar trayectorias de planes
             plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(NUM_MODES)], dim=1)
             
             # Seleccionar mejor futuro
-            plan_traj, prediction = select_future(plan_trajs, predictions, scores)
+            plan_traj, prediction = select_future(current_state, plan_trajs, delta_predictions, scores)
             
             # Si usamos planning, refinar con el planner
             if use_planning and planner is not None:

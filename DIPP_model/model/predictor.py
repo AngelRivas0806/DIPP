@@ -11,28 +11,29 @@ NUM_MODES = 20
 # vecinos(comparten pesos)y una para el ego"""
 
 class AgentEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, embed_dim):
         super(AgentEncoder, self).__init__()
-        self.embedding = nn.Linear(6, 16)  
-        self.motion = nn.LSTM(16, 256, 2, batch_first=True)
-    # return the last hidden state as the encoded feature, a tensor of shape (batch_size, 256).
+        self.embed_init= 16
+        self.embed_dim = embed_dim
+        self.embedding = nn.Linear(6,self.embed_init)  
+        self.motion    = nn.LSTM(self.embed_init, self.embed_dim, 2, batch_first=True)
+
+    # return the last hidden state as the encoded feature, a tensor of shape (batch_size, embed_dim).
     def forward(self, inputs):
         # Apply ReLU activation to the embedded features before feeding them into the LSTM
         embedded = nn.LeakyReLU()(self.embedding(inputs[:, :, :6]))
-        traj, _ = self.motion(embedded)
-        # Size of traj: (batch_size, seq_len, 256)
-        output = traj[:, -1]
+        traj, _  = self.motion(embedded)
+        # Size of traj: (batch_size, seq_len, embed_dim)
+        output   = traj[:, -1]
         return output
-
-
 
 """Multi-modal transformer module is used for agent2map, so we commented that code , we modified agent2agent to use it as well"""
 class MultiModalTransformer(nn.Module):
-    def __init__(self, modes=NUM_MODES, output_dim=256):
+    def __init__(self, modes, tokens_dim, output_dim=256):
         super(MultiModalTransformer, self).__init__()
-        self.modes = modes
-        self.attention = nn.ModuleList([nn.MultiheadAttention(256, 4, 0.1, batch_first=True) for _ in range(modes)])
-        self.ffn = nn.Sequential(nn.LayerNorm(256), nn.Linear(256, 1024), nn.ReLU(), nn.Dropout(0.1), nn.Linear(1024, output_dim), nn.LayerNorm(output_dim))
+        self.modes     = modes
+        self.attention = nn.ModuleList([nn.MultiheadAttention(tokens_dim, 4, 0.1, batch_first=True) for _ in range(modes)])
+        self.ffn = nn.Sequential(nn.LayerNorm(tokens_dim), nn.Linear(tokens_dim, 1024), nn.ReLU(), nn.Dropout(0.1), nn.Linear(1024, output_dim), nn.LayerNorm(output_dim))
 
     def forward(self, query, key, value, mask=None):
         attention_output = []
@@ -46,55 +47,53 @@ class MultiModalTransformer(nn.Module):
 
 
 class Agent2Agent(nn.Module):
-    def __init__(self, modes: int = NUM_MODES):
+    def __init__(self, modes: int, tokens_dim: int):
         super(Agent2Agent, self).__init__()
         self.modes = modes
         
         # Encoder to process interactions between agents
-        encoder_layer = nn.TransformerEncoderLayer(d_model=256, nhead=8, dim_feedforward=1024, activation='relu', batch_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=tokens_dim, nhead=8, dim_feedforward=1024, activation='relu', batch_first=True)
         self.interaction_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
         # Multi-modal attention to generate multiple interpretations
-        self.multimodal = MultiModalTransformer(modes=modes, output_dim=256)
+        # self.multimodal = MultiModalTransformer(modes=modes, output_dim=512)
         
     def forward(self, inputs, mask=None):
         # Step 1: Encode basic interactions
         encoded = self.interaction_net(inputs, src_key_padding_mask=mask)
-        # encoded: (batch, num_agents, 256)
+        # encoded: (batch, num_agents, tokens_dim)
 
         # Step 2: Generate NUM_MODES modes using self-attention
-        query = encoded  # (batch, num_agents, 256)
-        output = self.multimodal(query, encoded, encoded, mask)
-        # output: (batch, NUM_MODES, num_agents, 256)
-        
+        # query = encoded  # (batch, num_agents, tokens_dim)
+        # output = self.multimodal(query, encoded, encoded, mask)
+        # output: (batch, NUM_MODES, num_agents, tokens_dim)
+        output = encoded.unsqueeze(1).expand(-1, self.modes, -1, -1)  # (batch, NUM_MODES, num_agents, tokens_dim)
         return output
     
 
 """Decoders"""
 
 class AgentDecoder(nn.Module):
-    def __init__(self, future_steps, num_neighbors=10, num_modes=NUM_MODES):
+    def __init__(self, future_steps, token_dims, num_neighbors=10, num_modes=NUM_MODES):
         super(AgentDecoder, self).__init__()
         self._future_steps = future_steps 
         self._num_neighbors = num_neighbors
         self._num_modes = num_modes
-        # Output only 2 values (vx, vy) per step
-        self.decode = nn.Sequential(nn.Dropout(0.1), nn.Linear(256, 256), nn.ELU(), nn.Linear(256, future_steps*2))
+        # Output only 2 values (velocities vx, vy) per step
+        self.decode = nn.Sequential(nn.Dropout(0.1), nn.Linear(token_dims, 128), nn.ELU(),nn.Linear(128, 128), nn.ELU(), nn.Linear(128, future_steps*2))
 
     def transform(self, prediction, current_state, dt: float = 0.4):
-        x = current_state[:, 0]  # (B,)
-        y = current_state[:, 1]  # (B,)
-
+        x  = current_state[:, 0]  # (B,)
+        y  = current_state[:, 1]  # (B,)
         vx = prediction[:, :, 0]  # (B, T)
         vy = prediction[:, :, 1]  # (B, T)
 
-        # Integrar velocidades → posiciones acumuladas
+        # Integrate predicted velocities to get predicted positions
         new_x = x.unsqueeze(1) + torch.cumsum(vx * dt, dim=1)
         new_y = y.unsqueeze(1) + torch.cumsum(vy * dt, dim=1)
 
         # Output: [x, y]
         traj = torch.stack([new_x, new_y], dim=-1)
-
         return traj
        
     def forward(self, agent_agent, current_state):
@@ -106,14 +105,14 @@ class AgentDecoder(nn.Module):
         return trajs
 
 
-
-class AVDecoder(nn.Module):
-    def __init__(self, future_steps=12, num_modes=NUM_MODES):
-        super(AVDecoder, self).__init__()
+class PlanDecoder(nn.Module):
+    def __init__(self, future_steps, token_dims, num_modes=NUM_MODES):
+        super(PlanDecoder, self).__init__()
         self._future_steps = future_steps
-        self._num_modes = num_modes
+        self._num_modes    = num_modes
+        self.interm_dim    = 256
         # Output control variables (acceleration and direction change) instead of trajectories
-        self.control = nn.Sequential(nn.Dropout(0.1), nn.Linear(256, 256), nn.ELU(), nn.Linear(256, future_steps*2))
+        self.control = nn.Sequential(nn.Dropout(0.1), nn.Linear(token_dims, self.interm_dim), nn.ELU(), nn.Linear(self.interm_dim, future_steps*2))
         
         # 6 cost weights learnable (one per cost term)
         self.cost_weights = nn.Parameter(torch.ones(6, dtype=torch.float32))
@@ -144,10 +143,10 @@ class AVDecoder(nn.Module):
 """Score module"""
 
 class Score(nn.Module):
-    def __init__(self, num_modes=NUM_MODES):
+    def __init__(self, num_modes, tokens_dim):
         super(Score, self).__init__()
         self._num_modes = num_modes
-        self.decode = nn.Sequential(nn.Dropout(0.1), nn.Linear(256, 128), nn.ELU(), nn.Linear(128, 1))
+        self.decode = nn.Sequential(nn.Dropout(0.1), nn.Linear(tokens_dim, 128), nn.ELU(), nn.Linear(128, 1))
 
     def forward(self, agent_agent):
         # agent_agent: (batch, num_modes, num_agents, 256)
@@ -160,17 +159,18 @@ class Score(nn.Module):
 
 
 class Predictor(nn.Module):
-    def __init__(self, future_steps, num_neighbors=10, num_modes=NUM_MODES):
+    # Constructor
+    def __init__(self, future_steps, embed_dim=256, num_neighbors=10, num_modes=NUM_MODES):
         super(Predictor, self).__init__()
         self._future_steps  = future_steps
         self._num_neighbors = num_neighbors
         self._num_modes     = num_modes
-
-        self.pedestrian_net = AgentEncoder()    # historia → embedding 256
-        self.agent_agent    = Agent2Agent(modes=num_modes)
-        self.plan           = AVDecoder(future_steps=self._future_steps, num_modes=num_modes)
-        self.predict        = AgentDecoder(future_steps=self._future_steps, num_neighbors=num_neighbors, num_modes=num_modes)
-        self.score          = Score(num_modes=num_modes)
+        self.embed_dim      = embed_dim
+        self.pedestrian_net = AgentEncoder(embed_dim=self.embed_dim)    # Encoding the history of each agent: ego and neighbors (embed_dim)
+        self.agent_agent_net= Agent2Agent(modes=num_modes, tokens_dim=embed_dim) # Inter agent attention module
+        self.plan_net       = PlanDecoder(future_steps=self._future_steps, token_dims=embed_dim, num_modes=num_modes) # Plan decoder
+        self.predict        = AgentDecoder(future_steps=self._future_steps, token_dims=embed_dim, num_neighbors=num_neighbors, num_modes=num_modes) # Agent decoder
+        self.score          = Score(num_modes=num_modes, tokens_dim=embed_dim) # Score estimation
 
     def forward(self, ego, neighbors):
         """
@@ -192,10 +192,9 @@ class Predictor(nn.Module):
         neighbor_last = neighbors[:, :, -1, :]             # (B, N, feat_dim)
         neighbor_mask = (neighbor_last.sum(dim=-1) == 0)   # (B, N)  True = padding
         actor_mask = torch.cat([ego_mask, neighbor_mask], dim=1)  # (B, 1+N)
-        #agent_agent = self.agent_agent(actors, actor_mask)
-        agent_agent = self.agent_agent(actors, actor_mask)
+        agent_agent = self.agent_agent_net(actors, actor_mask)
         ego_modes = agent_agent[:, :, 0, :]  
-        plans, cost_function_weights = self.plan(ego_modes, None)
+        plans, cost_function_weights = self.plan_net(ego_modes, None)
         current_state_neighbors = neighbors[:, :, -1, :]
 
         # agent_agent[:, :, 1:] → (B, num_modes, num_neighbors, 256)

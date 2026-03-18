@@ -16,6 +16,7 @@ from utils.train_utils import *
 from model.planner import MotionPlanner
 from model.predictor import Predictor, NUM_MODES
 
+# One training epoch
 def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
     epoch_loss = []
     epoch_metrics = []
@@ -25,21 +26,21 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
     start_time = time.time()
 
     for batch_idx, batch in enumerate(data_loader):
-        # prepare data
-        ego = batch[0].to(args.device)
-        neighbors = batch[1].to(args.device)
+        # Prepare data
+        ego          = batch[0].to(args.device)
+        neighbors    = batch[1].to(args.device)
         ground_truth = batch[2].to(args.device)
 
         # ========================================================
         if batch_idx == 0:
-            print(f"\n=== Tensor Shapes en GPU ===")
+            print(f"\n=== Tensor Shapes in GPU ===")
             print(f"ego.shape: {ego.shape}")
             print(f"neighbors.shape: {neighbors.shape}")
             print(f"ground_truth.shape: {ground_truth.shape}")
             print(f"ego device: {ego.device}")
         # ========================================================
 
-        # current_state: (B, 11, feat) tomando el último frame observado
+        # current_state: (B, 11, feat) with the last observed state of ego and neighbors
         current_state = torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
 
         # weights: máscara para vecinos presentes (no-0)
@@ -64,7 +65,7 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
         )
 
         # pérdida multi-futuro multi-agente
-        loss = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights)
+        loss = MFMA_loss(current_state, plan_trajs, predictions, scores, ground_truth, weights)
         if isinstance(loss, (tuple, list)):
              loss = loss[0]
 
@@ -103,9 +104,10 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
 
             loss = loss + plan_loss + 1e-3 * plan_cost
         else:
-            plan, prediction = select_future(plan_trajs, predictions, scores)
+            # Use the most likely prediction for metrics (no planner)
+            plan, prediction = select_future(current_state, plan_trajs, predictions, scores)
 
-        # backward
+        # Backpropagation
         loss.backward()
         nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
         optimizer.step()
@@ -158,11 +160,11 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
                 [bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(NUM_MODES)],
                 dim=1
             )
-            loss = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights)
+            loss = MFMA_loss(current_state,plan_trajs, predictions, scores, ground_truth, weights)
             if isinstance(loss, (tuple, list)):
                 loss = loss[0]
         if use_planning:
-            plan, prediction = select_future(plans, predictions, scores)
+            plan, prediction = select_future(current_state, plans, predictions, scores)
             gt_trajectory = ground_truth[:, 0, :, :2]  # (B, 12, 2)  solo x,y
 
             planner_inputs = {
@@ -193,7 +195,7 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
 
             loss = loss + plan_loss + 1e-3 * plan_cost
         else:
-            plan, prediction = select_future(plan_trajs, predictions, scores)
+            plan, prediction = select_future(current_state, plan_trajs, predictions, scores)
 
         metrics = motion_metrics(plan, prediction, ground_truth, weights)
         epoch_metrics.append(metrics)
@@ -222,20 +224,20 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
 def model_training():
     # Logging
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    log_path = os.path.join(script_dir, f"training_log/{args.name}/")
+    log_path   = os.path.join(script_dir, f"training_log/{args.name}/")
     os.makedirs(log_path, exist_ok=True)
     initLogging(log_file=os.path.join(log_path, "train.log"))
 
     logging.info("------------- {} -------------".format(args.name))
-    logging.info("Batch size: {}".format(args.batch_size))
-    logging.info("Learning rate: {}".format(args.learning_rate))
-    logging.info("Use integrated planning module: {}".format(args.use_planning))
-    logging.info("Use device: {}".format(args.device))
+    logging.info("--- Batch size: {}".format(args.batch_size))
+    logging.info("--- Learning rate: {}".format(args.learning_rate))
+    logging.info("--- Use integrated planning module: {}".format(args.use_planning))
+    logging.info("--- Use device: {}".format(args.device))
 
-    # set seed
+    # Set seed
     set_seed(args.seed)
 
-    # predictor
+    # Sets up predictor
     predictor = Predictor(12).to(args.device)
 
     # planner
@@ -252,7 +254,7 @@ def model_training():
     train_epochs = args.train_epochs
     batch_size = args.batch_size
 
-    # dataset loaders
+    # Dataset loaders
     if args.train_set.endswith(".npz"):
         train_set = DrivingData(args.train_set)
         valid_set = DrivingData(args.valid_set)
@@ -266,19 +268,19 @@ def model_training():
     valid_loader = DataLoader(
         valid_set, batch_size=batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True
     )
-    logging.info("Dataset Prepared: {} train data, {} validation data\n".format(len(train_set), len(valid_set)))
+    logging.info("--- Dataset Prepared: {} train data, {} validation data\n".format(len(train_set), len(valid_set)))
 
     # train loop
     for epoch in range(train_epochs):
-        logging.info(f"Epoch {epoch+1}/{train_epochs}")
+        logging.info(f"--- Epoch {epoch+1}/{train_epochs}")
 
-        # si hay planner, pretrain predictor sin planning
+        # With a planner, pretrain predictor sin planning
         use_planning_now = args.use_planning
         if planner is not None:
             use_planning_now = (epoch >= args.pretrain_epochs)
 
         train_loss, train_metrics = train_epoch(train_loader, predictor, planner, optimizer, use_planning_now)
-        val_loss, val_metrics = valid_epoch(valid_loader, predictor, planner, use_planning_now)
+        val_loss, val_metrics     = valid_epoch(valid_loader, predictor, planner, use_planning_now)
 
         log = {
             "epoch": epoch + 1,
@@ -373,4 +375,5 @@ if __name__ == "__main__":
         if args.device == "cuda":
             args.device = "cuda:0"
 
+    # Main training function
     model_training()
