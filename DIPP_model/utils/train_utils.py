@@ -202,15 +202,18 @@ def _neighbor_presence_mask_from_weights(weights: torch.Tensor, N: int, T: int, 
 # =========================================================
 # Loss + Selection
 # =========================================================
-def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Optional[torch.Tensor] = None):
-    B, M, T, _ = plans.shape
-    _, _, N, _, _ = predictions.shape
-
+def MFMA_loss(current_state, plans, delta_predictions, scores, ground_truth, weights, best_mode: Optional[torch.Tensor] = None):
+    B, M, T, _    = plans.shape
+    _, _, N, _, _ = delta_predictions.shape
     # Máscara de vecinos presentes (B,N,T,1)
     neigh_mask = _neighbor_presence_mask_from_weights(weights, N=N, T=T, device=plans.device)
-    neigh_any = neigh_mask.any(dim=2, keepdim=True)  # (B,N,1,1)
-
+    neigh_any  = neigh_mask.any(dim=2, keepdim=True)  # (B,N,1,1)
+    if False:
+        predictions = current_state[:, 1:, :2].unsqueeze(1).unsqueeze(3) + delta_predictions.cumsum(dim=3)  # (B,M,N,T,2)
+    else:
+        predictions = delta_predictions
     predictions_masked = predictions * neigh_any[:, None].float()
+
 
     if best_mode is None:
         # ---- Pérdida conjunta por modo: ego + vecinos promediados
@@ -221,7 +224,7 @@ def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Opti
             reduction='none'
         ).mean(dim=[-1, -2])  # (B, M)
 
-        # Vecinos: (B, M, N, T, 2) → (B, M)
+        # Neighbors: (B, M, N, T, 2) → (B, M)
         nei_loss_per_mode = F.smooth_l1_loss(
             predictions_masked[:, :, :, :, :2],          # (B, M, N, T, 2)
             ground_truth[:, None, 1:, :, :2].expand(-1, M, -1, -1, -1),  # (B, M, N, T, 2)
@@ -243,9 +246,9 @@ def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Opti
     best_mode_plan = plans[torch.arange(B, device=plans.device), best_mode]               # (B,T,3)
     best_mode_pred = predictions_masked[torch.arange(B, device=plans.device), best_mode]  # (B,N,T,2)
 
-    dummy_theta = torch.zeros_like(best_mode_pred[:, :, :, :1])
-    best_mode_pred_3d = torch.cat([best_mode_pred, dummy_theta], dim=-1)
-    prediction_all = torch.cat([best_mode_plan.unsqueeze(1), best_mode_pred_3d], dim=1)  # (B,1+N,T,3)
+    dummy_theta      = torch.zeros_like(best_mode_pred[:, :, :, :1])
+    best_mode_pred_3d= torch.cat([best_mode_pred, dummy_theta], dim=-1)
+    prediction_all   = torch.cat([best_mode_plan.unsqueeze(1), best_mode_pred_3d], dim=1)  # (B,1+N,T,3)
 
     # ---- Loss sobre modo ganador
     pred_loss = 0.0
@@ -269,7 +272,7 @@ def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Opti
     return total, best_mode
 
 
-def select_future(plans, predictions, scores, best_mode: Optional[torch.Tensor] = None):
+def select_future(current_state, plans, delta_predictions, scores, best_mode: Optional[torch.Tensor] = None):
     """
     Seleccionar el mejor futuro basado en los scores (inferencia) o best_mode (entrenamiento)
     Args:
@@ -283,6 +286,10 @@ def select_future(plans, predictions, scores, best_mode: Optional[torch.Tensor] 
         best_mode = torch.argmax(scores, dim=-1)
 
     plan = plans[torch.arange(B, device=plans.device), best_mode]
+    if False:
+        predictions = current_state[:, 1:, :2].unsqueeze(1).unsqueeze(3) + delta_predictions.cumsum(dim=3)  # (B,M,N,T,2)
+    else:   
+        predictions = delta_predictions
     prediction = predictions[torch.arange(B, device=plans.device), best_mode]
     return plan, prediction
 
