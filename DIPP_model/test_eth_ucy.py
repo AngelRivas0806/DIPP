@@ -1,8 +1,3 @@
-"""
-Script de evaluación para datasets ETH/UCY procesados
-Open-loop testing (predicción sin replanning)
-"""
-
 import sys
 import torch
 import argparse
@@ -11,7 +6,7 @@ import os
 import logging
 from tqdm import tqdm
 from utils.train_utils import DrivingData, bicycle_model, select_future
-from utils.visualization import plot_trajectory_prediction, plot_multiple_samples
+from utils.visualization import plot_trajectory_prediction, plot_ego_top3_modes
 from model.predictor import Predictor, NUM_MODES
 from model.planner import MotionPlanner
 from torch.utils.data import DataLoader
@@ -111,16 +106,14 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
                     "control_variables": plan_control.view(ego.shape[0], 24),
                     "predictions": prediction,
                     "current_state": current_state,
-                    "gt_trajectory": gt_trajectory
                 }
                 
-                w = cost_function_weights  # (B, 6)
+                w = cost_function_weights  # (B, 5)
                 planner_inputs["w_acc"] = w[:, 0].unsqueeze(1)
                 planner_inputs["w_jerk"] = w[:, 1].unsqueeze(1)
                 planner_inputs["w_steer"] = w[:, 2].unsqueeze(1)
                 planner_inputs["w_steer_change"] = w[:, 3].unsqueeze(1)
                 planner_inputs["w_collision"] = w[:, 4].unsqueeze(1)
-                planner_inputs["w_tracking"] = w[:, 5].unsqueeze(1)
                 
                 final_values, info = planner.layer.forward(planner_inputs)
                 refined_control = final_values["control_variables"].view(-1, 12, 2)
@@ -165,6 +158,43 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
 
                     nb_hist = neighbors[b, :, :, :2].cpu().numpy()
                     n_valid = int(np.sum([np.sum(np.abs(nb_hist[n])) > 0 for n in range(nb_hist.shape[0])]))
+                    # Máscara de vecinos válidos usando el flag (col 6 del último frame)
+                    neigh_valid = (neighbors[b, :, -1, 6] > 0).cpu().numpy()  # (N,) bool
+
+                    # --- Top-3 modos del ego ---
+                    top3_modes = torch.argsort(scores[b], descending=True)[:3]              # (3,) tensor
+                    all_probs  = torch.softmax(scores[b], dim=0)                            # (20,) prob real sobre todos los modos
+                    top3_scores = all_probs[top3_modes].cpu().numpy()                       # (3,) prob relativa a los 20 modos
+
+                    if use_planning and planner is not None:
+                        # Refinar cada uno de los 3 modos con el planner
+                        top3_trajs_list   = []
+                        top3_nb_pred_list = []
+                        for k in range(3):
+                            mode_k = top3_modes[k].item()
+                            ctrl_k = plans[b:b+1, mode_k]           # (1, 12, 2)
+                            pred_k = predictions[b:b+1, mode_k]     # (1, N, 12, 2)
+                            planner_inputs_k = {
+                                "control_variables": ctrl_k.view(1, 24),
+                                "predictions":       pred_k,
+                                "current_state":     current_state[b:b+1],
+                                "w_acc":          cost_function_weights[b:b+1, 0].unsqueeze(1),
+                                "w_jerk":         cost_function_weights[b:b+1, 1].unsqueeze(1),
+                                "w_steer":        cost_function_weights[b:b+1, 2].unsqueeze(1),
+                                "w_steer_change": cost_function_weights[b:b+1, 3].unsqueeze(1),
+                                "w_collision":    cost_function_weights[b:b+1, 4].unsqueeze(1),
+                            }
+                            final_k, _ = planner.layer.forward(planner_inputs_k)
+                            refined_ctrl_k = final_k["control_variables"].view(1, 12, 2)
+                            traj_k = bicycle_model(refined_ctrl_k, ego[b:b+1, -1])[:, :, :2]  # (1,12,2)
+                            top3_trajs_list.append(traj_k.squeeze(0).cpu().numpy())        # (12,2)
+                            top3_nb_pred_list.append(pred_k.squeeze(0).cpu().numpy())      # (N,12,2)
+                        top3_trajs_norm    = np.stack(top3_trajs_list,   axis=0)  # (3,12,2)
+                        top3_nb_preds_norm = np.stack(top3_nb_pred_list, axis=0)  # (3,N,12,2)
+                    else:
+                        # Sin planner: usar plan_trajs ya calculadas
+                        top3_trajs_norm    = plan_trajs[b][top3_modes][:, :, :2].cpu().numpy()  # (3,12,2)
+                        top3_nb_preds_norm = predictions[b][top3_modes][:, :, :, :2].cpu().numpy()  # (3,N,12,2)
 
                     # --- Desnormalización ---
                     if raw_dataset is not None:
@@ -189,13 +219,17 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
                         nb_hist_dn    = denorm_xy(nb_hist)
                         nb_pred_dn    = denorm_xy(neighbor_pred[b, :, :, :].cpu().numpy())
                         nb_gt_dn      = denorm_xy(neighbor_gt[b, :, :, :].cpu().numpy())
+                        top3_trajs_dn    = np.stack([denorm_xy(top3_trajs_norm[k])    for k in range(3)], axis=0)
+                        top3_nb_preds_dn = np.stack([denorm_xy(top3_nb_preds_norm[k]) for k in range(3)], axis=0)
                     else:
-                        ego_hist_dn  = ego[b, :, :2].cpu().numpy()
-                        ego_pred_dn  = ego_pred[b, :, :].cpu().numpy()
-                        ego_gt_dn    = ego_gt[b, :, :].cpu().numpy()
-                        nb_hist_dn   = nb_hist
-                        nb_pred_dn   = neighbor_pred[b, :, :, :].cpu().numpy()
-                        nb_gt_dn     = neighbor_gt[b, :, :, :].cpu().numpy()
+                        ego_hist_dn   = ego[b, :, :2].cpu().numpy()
+                        ego_pred_dn   = ego_pred[b, :, :].cpu().numpy()
+                        ego_gt_dn     = ego_gt[b, :, :].cpu().numpy()
+                        nb_hist_dn    = nb_hist
+                        nb_pred_dn    = neighbor_pred[b, :, :, :].cpu().numpy()
+                        nb_gt_dn      = neighbor_gt[b, :, :, :].cpu().numpy()
+                        top3_trajs_dn    = top3_trajs_norm
+                        top3_nb_preds_dn = top3_nb_preds_norm
 
                     sample_data = {
                         'ego_hist': ego_hist_dn,
@@ -205,6 +239,10 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
                         'neighbors_pred': nb_pred_dn,
                         'neighbors_gt':   nb_gt_dn,
                         'num_valid_neighbors': int(n_valid),
+                        'neighbors_valid':     neigh_valid,         # (N,) bool — flag del dataset
+                        'ego_top3_trajs':      top3_trajs_dn,       # (3, pred_len, 2)
+                        'ego_top3_scores':     top3_scores,         # (3,) probabilidades softmax
+                        'ego_top3_nb_preds':   top3_nb_preds_dn,   # (3, N, pred_len, 2)
                     }
                     vis_samples.append(sample_data)
     # Calcular promedios
@@ -229,7 +267,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for testing')
     parser.add_argument('--use_planning', action='store_true', help='Use planning module')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use')
-    parser.add_argument('--num_vis_samples', type=int, default=10, help='Number of samples to visualize')
+    parser.add_argument('--num_vis_samples', type=int, default=20, help='Number of samples to visualize')
     parser.add_argument('--min_neighbors', type=int, default=0, help='Minimum valid neighbors to include a sample in visualization')
     
     args = parser.parse_args()
@@ -266,7 +304,7 @@ def main():
     if args.use_planning:
         logging.info("Setting up planner...")
         trajectory_len, feature_len = 12, 9
-        planner = MotionPlanner(trajectory_len, args.device)
+        planner = MotionPlanner(trajectory_len, args.device, test=True)
         logging.info("Planner ready!")
     
     # Cargar datos
@@ -295,22 +333,21 @@ def main():
         logging.info("Generating visualizations...")
         logging.info(f"{'='*60}\n")
         
-        # Visualizaciones individuales
+        # Visualizaciones de top-3 modos (una imagen con 3 subplots por muestra)
         for idx, sample in enumerate(results['vis_samples']):
-            plot_trajectory_prediction(
-                ego_hist=sample['ego_hist'],
-                ego_pred=sample['ego_pred'],
-                ego_gt=sample['ego_gt'],
-                neighbors_hist=sample['neighbors_hist'],
-                neighbors_pred=sample['neighbors_pred'],
-                neighbors_gt=sample['neighbors_gt'],
-                save_path=vis_path,
-                show=False,
-                sample_id=idx
-            )
-        
-        # Cuadrícula con múltiples muestras
-        plot_multiple_samples(results['vis_samples'], vis_path, max_samples=6)
+            if 'ego_top3_trajs' in sample:
+                plot_ego_top3_modes(
+                    ego_hist=sample['ego_hist'],
+                    ego_gt=sample['ego_gt'],
+                    ego_top3_trajs=sample['ego_top3_trajs'],
+                    ego_top3_scores=sample.get('ego_top3_scores', None),
+                    ego_top3_nb_preds=sample.get('ego_top3_nb_preds', None),
+                    neighbors_hist=sample['neighbors_hist'],
+                    neighbors_valid=sample.get('neighbors_valid', None),
+                    neighbors_gt=sample['neighbors_gt'],
+                    save_path=vis_path,
+                    sample_id=idx
+                )
         
         logging.info(f"Visualizations saved to: {vis_path}")
     
