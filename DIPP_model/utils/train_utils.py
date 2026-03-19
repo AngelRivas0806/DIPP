@@ -203,22 +203,17 @@ def _neighbor_presence_mask_from_weights(weights: torch.Tensor, N: int, T: int, 
 # Loss + Selection
 # =========================================================
 def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Optional[torch.Tensor] = None, ego_in_pred_loss: bool = True):
-    B, M, T, _ = plans.shape
+    B, M, T, _    = plans.shape
     _, _, N, _, _ = predictions.shape
 
     # Máscara de vecinos presentes (B,N,T,1)
     neigh_mask = _neighbor_presence_mask_from_weights(weights, N=N, T=T, device=plans.device)
     neigh_any  = neigh_mask.any(dim=2, keepdim=True)  # (B,N,1,1)
-    if False:
-        predictions = current_state[:, 1:, :2].unsqueeze(1).unsqueeze(3) + delta_predictions.cumsum(dim=3)  # (B,M,N,T,2)
-    else:
-        predictions = delta_predictions
     predictions_masked = predictions * neigh_any[:, None].float()
 
 
     if best_mode is None:
         # ---- Selección best_mode: suma de errores por modo (sin promediar)
-
         # Ego: suma sobre T y xy → (B, M)
         ego_loss_per_mode = F.smooth_l1_loss(
             plans[:, :, :, :2],
@@ -232,7 +227,6 @@ def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Opti
             ground_truth[:, None, 1:, :, :2].expand(-1, M, -1, -1, -1),
             reduction='none'
         ).sum(dim=-1)  # (B, M, N, T)
-
         nei_loss_per_mode = (nei_loss_per_mode * neigh_mask[:, None, :, :, 0].float()).sum(dim=[-1, -2])  # (B, M)
 
         # Suma conjunta: ego + vecinos (sin normalizar)

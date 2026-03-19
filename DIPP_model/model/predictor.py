@@ -14,6 +14,7 @@ one for the neighbors and one for the ego agent.
 class AgentEncoder(nn.Module):
     def __init__(self, embed_dim):
         super(AgentEncoder, self).__init__()
+        # TODO: can play with the embedding dimension and the number of LSTM layers here.
         self.embed_init= 16
         self.embed_dim = embed_dim
         # First embedding, before passing to LSTM
@@ -25,10 +26,9 @@ class AgentEncoder(nn.Module):
     def forward(self, inputs):
         # TODO: test different activations here.
         # Apply GELU activation to the embedded features before feeding them into the LSTM
-        embedded = nn.GELU()(self.embedding(inputs[:, :, :6]))
-        traj, _  = self.motion(embedded)
-        # (B,E,T) → (B,E)
-        output   = traj[:, -1]
+        embedded = nn.GELU()(self.embedding(inputs[:, :, :6])) # (B,T,6) → (B,T,E)
+        traj, _  = self.motion(embedded) # (B,T,E) → (B,T,H)
+        output   = traj[:, -1] # (B,T,H) → (B,H)
         return output
 
 """Multi-modal transformer module is used for agent2map, so we commented that code , we modified agent2agent to use it as well"""
@@ -37,7 +37,7 @@ class MultiModalTransformer(nn.Module):
         super(MultiModalTransformer, self).__init__()
         self.modes     = modes
         self.attention = nn.ModuleList([nn.MultiheadAttention(tokens_dim, 4, 0.1, batch_first=True) for _ in range(modes)])
-        self.ffn = nn.Sequential(nn.LayerNorm(tokens_dim), nn.Linear(tokens_dim, 1024), nn.ReLU(), nn.Dropout(0.1), nn.Linear(1024, output_dim), nn.LayerNorm(output_dim))
+        self.ffn       = nn.Sequential(nn.LayerNorm(tokens_dim), nn.Linear(tokens_dim, 1024), nn.ReLU(), nn.Dropout(0.1), nn.Linear(1024, output_dim), nn.LayerNorm(output_dim))
 
     def forward(self, query, key, value, mask=None):
         attention_output = []
@@ -45,9 +45,7 @@ class MultiModalTransformer(nn.Module):
             attention_output.append(self.attention[i](query, key, value, key_padding_mask=mask)[0])
         attention_output = torch.stack(attention_output, dim=1)
         output = self.ffn(attention_output)
-
         return output
-
 
 """
 Agent2Agent
@@ -60,19 +58,13 @@ class Agent2Agent(nn.Module):
         
         # Encoder to process interactions between agents
         # TODO: test different numbers of heads, feedforward dimensions, activation functions, number of layers.
-        encoder_layer = nn.TransformerEncoderLayer(d_model=tokens_dim, nhead=8, dim_feedforward=1024, activation='relu', batch_first=True)
-        self.interaction_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        
+        encoder_layer             = nn.TransformerEncoderLayer(d_model=tokens_dim, nhead=8, dim_feedforward=1024, activation='relu', batch_first=True)
+        self.interaction_net      = nn.TransformerEncoder(encoder_layer, num_layers=2)
+
     def forward(self, inputs, mask=None):
         # Encode basic interactions
         encoded = self.interaction_net(inputs, src_key_padding_mask=mask)
-        # Expand the encoded features to have a separate version for each mode
-        output = encoded.unsqueeze(1).expand(-1, self.modes, -1, -1)  # (B,M,N,E)
-        if False:
-            # Produce Gaussian noise in size (B,1,N,E) and add it to the output to encourage diversity in the modes
-            noise = torch.randn_like(output[:, :1, :, :]) * 0.1 
-            output= output + noise
-        return output
+        return encoded
     
 
 """
@@ -102,16 +94,17 @@ class AgentDecoder(nn.Module):
             return prediction  # (B, M, N, T, 2)
 
         # La red predice (vx, vy) velocidades → integrar desde posición actual
-        state0 = current_state[:, :, 0:2].unsqueeze(1).unsqueeze(3)  # (B, 1,N,1, 2)
+        state0 = current_state[:, :, 0:2].unsqueeze(1).unsqueeze(3)  # (B,1,N,1,2)
         v      = prediction[:, :, :, :, :]  # (B, M, N, T, 2)
-        states = state0 + torch.cumsum(v * dt, dim=3)  # (B, M, N, T, 2)
+        # Use broadcasting to add the initial state to the cumulative sum of velocities to get positions
+        states = state0 + torch.cumsum(v * dt, dim=3)  # (B,M,N,T,2)
         return states
     
     def forward(self, agent_agent, current_state):
-        B = agent_agent.shape[0]
-        # decoded: (B, M, N, T, 2)
+        B = agent_agent.shape[0] # (B,N,N,H)
+        # decoded: (B,M,N,T,2)
         decoded = self.decode(agent_agent).view(B, self._num_modes, self._num_neighbors, self._future_steps, 2)
-        trajs = self.transform(decoded, current_state)  # (B, M, N, T, 2)
+        trajs   = self.transform(decoded, current_state)  # (B, M, N, T, 2)
         return trajs
 
 
@@ -153,8 +146,9 @@ class PlanDecoder(nn.Module):
 
         return actions, cost_function_weights
 
-"""Score module"""
-
+"""
+Score module
+"""
 class Score(nn.Module):
     def __init__(self, num_modes, tokens_dim):
         super(Score, self).__init__()
@@ -169,7 +163,36 @@ class Score(nn.Module):
         # scores → (batch, num_modes)
         return scores
 
+"""
+Multi-modalizer module
+"""
+class MultiModalizer(nn.Module):
+    def __init__(self, num_modes, tokens_dim):
+        super(MultiModalizer, self).__init__()
+        self.modes     = num_modes
+        self.tokens_dim= tokens_dim
+        self.attention = nn.ModuleList([nn.MultiheadAttention(tokens_dim, 4, 0.1, batch_first=True) for _ in range(num_modes)])
+        self.ffn       = nn.Sequential(nn.LayerNorm(tokens_dim), nn.Linear(tokens_dim, 1024), nn.ReLU(), nn.Dropout(0.1), nn.Linear(1024, tokens_dim), nn.LayerNorm(tokens_dim))
 
+    def forward(self, agent_agent, method='default', mask=None):
+        if method == 'default':
+            # We simply expand the agent-agent features to have a separate version for each mode without any transformation.
+            output = agent_agent.unsqueeze(1).expand(-1, self.modes, -1, -1)  # (B,M,N,H)
+        elif method == 'attention':
+            attention_output = []
+            for i in range(self.modes):
+                attention_output.append(self.attention[i](agent_agent, agent_agent, agent_agent, key_padding_mask=mask)[0])
+            attention_output = torch.stack(attention_output, dim=1)
+            output = self.ffn(attention_output)
+        elif method == 'noise':
+            # Project to smaller dimension, then concatenate random noise
+            projected = nn.Linear(agent_agent.shape[-1], self.tokens_dim-16,device=agent_agent.device)(agent_agent)  # (B,N,H/2)
+            projected = projected.unsqueeze(1).expand(-1, self.modes, -1, -1)
+            noise     = torch.randn(agent_agent.shape[0], self.modes, agent_agent.shape[1], 16, device=agent_agent.device)  # (B,M,N,H/2)
+            output    = torch.cat([projected, noise], dim=-1)  # (B,M,N,H)
+        else:
+            raise ValueError(f"Unknown multi-modalization method: {method}")
+        return output
 
 class Predictor(nn.Module):
     # Constructor
@@ -184,6 +207,7 @@ class Predictor(nn.Module):
         self.plan_net       = PlanDecoder(future_steps=self._future_steps, token_dims=embed_dim, num_modes=num_modes) # Plan decoder
         self.predict        = AgentDecoder(future_steps=self._future_steps, token_dims=embed_dim, num_neighbors=num_neighbors, num_modes=num_modes, predict_positions=predict_positions) # Agent decoder
         self.score          = Score(num_modes=num_modes, tokens_dim=embed_dim) # Score estimation
+        self.multi_modalizer= MultiModalizer(num_modes=num_modes, tokens_dim=embed_dim) # Multi-modal transformer for agent-agent interactions
 
     def forward(self, ego, neighbors):
         """
@@ -192,21 +216,29 @@ class Predictor(nn.Module):
         """
         B = ego.shape[0]
 
+        # TODO: could do these calls to pedestrian_net with a single call
+        # Encode ego
         ego_embed = self.pedestrian_net(ego)  # (B, 256)
-
+        # Encode neighbors
         neighbor_embeds = torch.stack([self.pedestrian_net(neighbors[:, i]) for i in range(self._num_neighbors)], dim=1)  
         # (B, num_neighbors, 256)
-
         actors = torch.cat([ego_embed.unsqueeze(1), neighbor_embeds], dim=1)
 
         device = ego.device
 
         ego_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)  # (B,1)
-        neighbor_last = neighbors[:, :, -1, :]             # (B, N, feat_dim)
-        neighbor_mask = (neighbor_last[:, :, 6] == 0)      # (B, N)  True = ausente (flag==0)
-        actor_mask = torch.cat([ego_mask, neighbor_mask], dim=1)  # (B, 1+N)
+        neighbor_last = neighbors[:, :, -1, :]                         # (B, N, feat_dim)
+        neighbor_mask = (neighbor_last[:, :, 6] == 0)                  # (B, N)  True = ausente (flag==0)
+        actor_mask = torch.cat([ego_mask, neighbor_mask], dim=1)       # (B, 1+N)
+
+        # Process interactions between all agents with the agent_agent_net transformer encoder
         agent_agent = self.agent_agent_net(actors, actor_mask)
-        ego_modes = agent_agent[:, :, 0, :]  
+
+        # Apply multi-modal transformer to agent-agent features to get mode-specific embeddings for each neighbor
+        agent_agent = self.multi_modalizer(agent_agent,method='default', mask=actor_mask)  # (B,M,N,H)
+        
+        # Planning
+        ego_modes = agent_agent[:,:,0]
         plans, cost_function_weights = self.plan_net(ego_modes)
         current_state_neighbors = neighbors[:, :, -1, :]
 
@@ -217,7 +249,6 @@ class Predictor(nn.Module):
         )
         # predictions: (B, num_modes, num_neighbors, future_steps, 3)
         scores = self.score(agent_agent)  # (B, num_modes) = (B, 3)
-
         return plans, predictions, scores, cost_function_weights
 
 
