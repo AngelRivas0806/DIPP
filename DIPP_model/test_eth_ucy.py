@@ -48,14 +48,14 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
     """
     model.eval()
     
-    # Métricas acumuladas
-    ego_ades, ego_fdes = [], []
+    # Accumulated metrics
+    ego_ades, ego_fdes           = [], []
     neighbor_ades, neighbor_fdes = [], []
     
-    # Pre-calcular índices candidatos para visualización (distribuidos uniformemente)
+    # Precompute candidate indices for visualization (uniformly distributed)
     vis_candidate_indices = set()
     if visualize and raw_dataset is not None:
-        neighbors_raw = raw_dataset.neighbors  # (N, K, obs, 7)
+        neighbors_raw = raw_dataset.neighbors  # (N,K,obs,7)
         valid_counts = np.array([
             int(np.sum(np.sum(np.abs(neighbors_raw[i]), axis=(1, 2)) > 0))
             for i in range(len(raw_dataset))
@@ -81,16 +81,12 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
             current_state= torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
 
             # Predicción
-            plans, delta_predictions, scores, cost_function_weights = model(ego, neighbors)
-            if False:
-                predictions = current_state[:, 1:, :2].unsqueeze(1).unsqueeze(3) + delta_predictions.cumsum(dim=3)  # (B,M,N,T,2)
-            else:
-                predictions = delta_predictions
+            plans, predictions, scores, cost_function_weights = model(ego, neighbors)
             # Generar trayectorias de planes
             plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(NUM_MODES)], dim=1)
             
             # Seleccionar mejor futuro
-            plan_traj, prediction = select_future(current_state, plan_trajs, delta_predictions, scores)
+            plan_traj, prediction = select_future(current_state, plan_trajs, predictions, scores)
             
             # Si usamos planning, refinar con el planner
             if use_planning and planner is not None:
@@ -132,10 +128,12 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
             neighbor_gt = ground_truth[:, 1:, :, :2]  # (batch, num_neighbors, pred_len, 2)
             neighbor_pred = prediction[:, :, :, :2]  # (batch, num_neighbors, pred_len, 2)
             
-            # Máscara de vecinos válidos
-            valid_mask = torch.sum(torch.abs(neighbor_gt), dim=(2, 3)) > 0  # (batch, num_neighbors)
+            # Mask for valid neighbors
+            valid_mask = torch.sum(torch.abs(neighbor_gt), dim=(2, 3)) > 0  # (B,N)
             
+            # For any data in the batch
             for b in range(neighbor_gt.shape[0]):
+                # For all neighbors
                 for n in range(neighbor_gt.shape[1]):
                     if valid_mask[b, n]:
                         # Aplanar a (1, pred_len, 2) para compute_ade_fde

@@ -173,17 +173,22 @@ class MultiModalizer(nn.Module):
         self.tokens_dim= tokens_dim
         self.attention = nn.ModuleList([nn.MultiheadAttention(tokens_dim, 4, 0.1, batch_first=True) for _ in range(num_modes)])
         self.ffn       = nn.Sequential(nn.LayerNorm(tokens_dim), nn.Linear(tokens_dim, 1024), nn.ReLU(), nn.Dropout(0.1), nn.Linear(1024, tokens_dim), nn.LayerNorm(tokens_dim))
+        self.mode_embeddings = nn.Embedding(num_modes,tokens_dim,max_norm=1.0)
 
     def forward(self, agent_agent, method='default', mask=None):
         if method == 'default':
             # We simply expand the agent-agent features to have a separate version for each mode without any transformation.
             output = agent_agent.unsqueeze(1).expand(-1, self.modes, -1, -1)  # (B,M,N,H)
         elif method == 'attention':
+            # We produce mode-specific features from different attention heads.
             attention_output = []
             for i in range(self.modes):
                 attention_output.append(self.attention[i](agent_agent, agent_agent, agent_agent, key_padding_mask=mask)[0])
             attention_output = torch.stack(attention_output, dim=1)
             output = self.ffn(attention_output)
+        elif method == 'learnable_embedding':
+            # Use learnable embeddings for each mode
+            output = agent_agent.unsqueeze(1).expand(-1, self.modes, -1, -1) + 0.1*self.mode_embeddings.weight.unsqueeze(0).unsqueeze(2)
         elif method == 'noise':
             # Project to smaller dimension, then concatenate random noise
             projected = nn.Linear(agent_agent.shape[-1], self.tokens_dim-16,device=agent_agent.device)(agent_agent)  # (B,N,H/2)
@@ -202,6 +207,7 @@ class Predictor(nn.Module):
         self._num_neighbors = num_neighbors
         self._num_modes     = num_modes
         self.embed_dim      = embed_dim
+        #TODO: test with a separate encoder for ego
         self.pedestrian_net = AgentEncoder(embed_dim=self.embed_dim)    # Encoding the history of each agent: ego and neighbors (embed_dim)
         self.agent_agent_net= Agent2Agent(modes=num_modes, tokens_dim=embed_dim) # Inter agent attention module
         self.plan_net       = PlanDecoder(future_steps=self._future_steps, token_dims=embed_dim, num_modes=num_modes) # Plan decoder

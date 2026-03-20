@@ -320,26 +320,6 @@ def check_dynamics(traj):
 
     return np.mean(np.abs(acc)), np.mean(np.abs(jerk)), np.mean(np.abs(lat_acc))
 
-def check_traffic(traj, ref_line):
-    red_light = False
-    off_route = False
-
-    # project to frenet
-    distance_to_ref = T.distance.cdist(traj[:, :2], ref_line[:, :2])
-    s_ego = np.argmin(distance_to_ref, axis=-1)
-    distance_to_route = np.min(distance_to_ref, axis=-1)
-
-    if np.any(distance_to_route > 5):
-        off_route = True
-
-    # get stop point 
-    stop_point = np.where(ref_line[:, -1]==0)[0]
-
-    if stop_point.any() and np.any(s_ego > np.min(stop_point)):
-        red_light = True
-
-    return red_light, off_route
-
 def check_similarity(traj, gt):
     error = np.linalg.norm(traj[:, :2] - gt[:, :2], axis=-1)
     
