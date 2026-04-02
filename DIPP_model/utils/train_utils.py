@@ -203,36 +203,23 @@ def _neighbor_presence_mask_from_weights(weights: torch.Tensor, N: int, T: int, 
 # Loss + Selection
 # =========================================================
 def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Optional[torch.Tensor] = None, ego_in_pred_loss: bool = True):
+
     B, M, T, _ = plans.shape
     _, _, N, _, _ = predictions.shape
 
     # Máscara de vecinos presentes (B,N,T,1)
     neigh_mask = _neighbor_presence_mask_from_weights(weights, N=N, T=T, device=plans.device)
     neigh_any  = neigh_mask.any(dim=2, keepdim=True)  # (B,N,1,1)
-    if False:
-        predictions = current_state[:, 1:, :2].unsqueeze(1).unsqueeze(3) + delta_predictions.cumsum(dim=3)  # (B,M,N,T,2)
-    else:
-        predictions = delta_predictions
     predictions_masked = predictions * neigh_any[:, None].float()
 
-
     if best_mode is None:
+    
         # ---- Selección best_mode: suma de errores por modo (sin promediar)
-
         # Ego: suma sobre T y xy → (B, M)
-        ego_loss_per_mode = F.smooth_l1_loss(
-            plans[:, :, :, :2],
-            ground_truth[:, None, 0, :, :2].expand(-1, M, -1, -1),
-            reduction='none'
-        ).sum(dim=[-1, -2])  # (B, M)
+        ego_loss_per_mode = F.smooth_l1_loss(plans[:, :, :, :2], ground_truth[:, None, 0, :, :2].expand(-1, M, -1, -1), reduction='none').sum(dim=[-1, -2])  
 
         # Vecinos: suma sobre xy → (B, M, N, T), luego suma sobre N y T enmascarando ausentes → (B, M)
-        nei_loss_per_mode = F.smooth_l1_loss(
-            predictions_masked[:, :, :, :, :2],
-            ground_truth[:, None, 1:, :, :2].expand(-1, M, -1, -1, -1),
-            reduction='none'
-        ).sum(dim=-1)  # (B, M, N, T)
-
+        nei_loss_per_mode = F.smooth_l1_loss( predictions_masked[:, :, :, :, :2], ground_truth[:, None, 1:, :, :2].expand(-1, M, -1, -1, -1), reduction='none').sum(dim=-1) 
         nei_loss_per_mode = (nei_loss_per_mode * neigh_mask[:, None, :, :, 0].float()).sum(dim=[-1, -2])  # (B, M)
 
         # Suma conjunta: ego + vecinos (sin normalizar)
@@ -269,24 +256,75 @@ def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Opti
     return total, pred_loss, score_loss, best_mode
 
 
-def select_future(current_state, plans, delta_predictions, scores, best_mode: Optional[torch.Tensor] = None):
+# ==================================================
+# Loss for VAE
+# ==================================================
+
+def VAE_loss(plans, predictions, ground_truth, weights, mu, logvar, ego_in_pred_loss: bool = True, beta: float = 1.0):
+
+    # plans:       (B, 1, T, 3)   -> (B, T, 3)
+    # predictions: (B, 1, N, T, 2)-> (B, N, T, 2)
+    plans = plans[:, 0]
+    predictions = predictions[:, 0]
+
+    B, T, _ = plans.shape
+    _, N, _, _ = predictions.shape
+
+    # neigh_mask: (B, N, T, 1)
+    # indica si cada vecino está presente en cada timestep
+    neigh_mask = _neighbor_presence_mask_from_weights( weights, N=N, T=T, device=plans.device)
+
+    # neigh_any: (B, N, 1, 1)
+    # indica si cada vecino apareció al menos una vez
+    neigh_any = neigh_mask.any(dim=2, keepdim=True).float()
+    predictions_masked = predictions * neigh_any
+
+    # Pérdida de predicción / reconstrucción
+    pred_loss = torch.tensor(0.0, device=plans.device)
+
+    # Pérdida del ego
+    if ego_in_pred_loss:
+        ego_pred_xy = plans[:, :, :2]           # (B, T, 2)
+        ego_gt_xy   = ground_truth[:, 0, :, :2] # (B, T, 2)
+
+        ego_l = F.smooth_l1_loss(ego_pred_xy, ego_gt_xy, reduction='sum')
+        pred_loss = pred_loss + ego_l
+
+    # Pérdida de vecinos
+    gt_nei_xy   = ground_truth[:, 1:, :, :2]       # (B, N, T, 2)
+    pred_nei_xy = predictions_masked[:, :, :, :2]  # (B, N, T, 2)
+
+    # Error por vecino y por tiempo
+    # salida: (B, N, T, 1)
+    nei_l = F.smooth_l1_loss(pred_nei_xy, gt_nei_xy, reduction='none').sum(dim=-1, keepdim=True)
+
+    # Solo contar timesteps válidos según neigh_mask
+    nei_l = (nei_l * neigh_mask.float()).sum()
+
+    pred_loss = pred_loss + nei_l
+
+    # Pérdida KL del VAE
+    # KL(q(z|x) || N(0, I))
+    # Primero sumamos en latent_dim, luego promediamos en batch
+    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+
+    total_loss = pred_loss + beta * kl_loss
+
+    return total_loss, pred_loss, kl_loss
+
+def select_future(plans, predictions, scores, best_mode: Optional[torch.Tensor] = None):
     """
     Seleccionar el mejor futuro basado en los scores (inferencia) o best_mode (entrenamiento)
-    Args:
-        plans: (B, M, T, Fp)
-        predictions: (B, M, N, T, Fq)
-        scores: (B, M)
-        best_mode: (B,) opcional
     """
+
     B = plans.shape[0]
+
     if best_mode is None:
         best_mode = torch.argmax(scores, dim=-1)
+    
+    best_mode = best_mode.to(plans.device).long()
 
     plan = plans[torch.arange(B, device=plans.device), best_mode]
-    if False:
-        predictions = current_state[:, 1:, :2].unsqueeze(1).unsqueeze(3) + delta_predictions.cumsum(dim=3)  # (B,M,N,T,2)
-    else:   
-        predictions = delta_predictions
     prediction = predictions[torch.arange(B, device=plans.device), best_mode]
     return plan, prediction
 
@@ -329,29 +367,29 @@ def motion_metrics(plan_trajectory, prediction_trajectories, ground_truth_trajec
 # =========================================================
 # Frame projections
 # =========================================================
-def project_to_frenet_frame(traj, ref_line):
-    distance_to_ref = torch.cdist(traj[:, :, :2], ref_line[:, :, :2])
-    k = torch.argmin(distance_to_ref, dim=-1).view(-1, traj.shape[1], 1).expand(-1, -1, 3)
-    ref_points = torch.gather(ref_line, 1, k)
-    x_r, y_r, theta_r = ref_points[:, :, 0], ref_points[:, :, 1], ref_points[:, :, 2]
-    x, y = traj[:, :, 0], traj[:, :, 1]
-    s = 0.1 * (k[:, :, 0] - 200)
-    l = torch.sign((y - y_r) * torch.cos(theta_r) - (x - x_r) * torch.sin(theta_r)) * torch.sqrt(
-        torch.square(x - x_r) + torch.square(y - y_r)
-    )
-    sl = torch.stack([s, l], dim=-1)
-    return sl
+# def project_to_frenet_frame(traj, ref_line):
+#     distance_to_ref = torch.cdist(traj[:, :, :2], ref_line[:, :, :2])
+#     k = torch.argmin(distance_to_ref, dim=-1).view(-1, traj.shape[1], 1).expand(-1, -1, 3)
+#     ref_points = torch.gather(ref_line, 1, k)
+#     x_r, y_r, theta_r = ref_points[:, :, 0], ref_points[:, :, 1], ref_points[:, :, 2]
+#     x, y = traj[:, :, 0], traj[:, :, 1]
+#     s = 0.1 * (k[:, :, 0] - 200)
+#     l = torch.sign((y - y_r) * torch.cos(theta_r) - (x - x_r) * torch.sin(theta_r)) * torch.sqrt(
+#         torch.square(x - x_r) + torch.square(y - y_r)
+#     )
+#     sl = torch.stack([s, l], dim=-1)
+#     return sl
 
 
-def project_to_cartesian_frame(traj, ref_line):
-    k = (10 * traj[:, :, 0] + 200).long()
-    k = torch.clip(k, 0, 1200 - 1)
-    ref_points = torch.gather(ref_line, 1, k.view(-1, traj.shape[1], 1).expand(-1, -1, 3))
-    x_r, y_r, theta_r = ref_points[:, :, 0], ref_points[:, :, 1], ref_points[:, :, 2]
-    x = x_r - traj[:, :, 1] * torch.sin(theta_r)
-    y = y_r + traj[:, :, 1] * torch.cos(theta_r)
-    xy = torch.stack([x, y], dim=-1)
-    return xy
+# def project_to_cartesian_frame(traj, ref_line):
+#     k = (10 * traj[:, :, 0] + 200).long()
+#     k = torch.clip(k, 0, 1200 - 1)
+#     ref_points = torch.gather(ref_line, 1, k.view(-1, traj.shape[1], 1).expand(-1, -1, 3))
+#     x_r, y_r, theta_r = ref_points[:, :, 0], ref_points[:, :, 1], ref_points[:, :, 2]
+#     x = x_r - traj[:, :, 1] * torch.sin(theta_r)
+#     y = y_r + traj[:, :, 1] * torch.cos(theta_r)
+#     xy = torch.stack([x, y], dim=-1)
+#     return xy
 
 
 # =========================================================

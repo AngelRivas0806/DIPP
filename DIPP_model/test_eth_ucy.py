@@ -5,12 +5,14 @@ import numpy as np
 import os
 import logging
 from tqdm import tqdm
+from model.predictorvae import PredictorVAE
 from utils.train_utils import DrivingData, bicycle_model, select_future
 from utils.visualization import plot_trajectory_prediction, plot_ego_top3_modes
-from model.predictor import Predictor, NUM_MODES
+from model.predictor import Predictor
 from model.planner import MotionPlanner
 from torch.utils.data import DataLoader
 
+NUM_MODES = int()
 
 def compute_ade_fde(predictions, ground_truth):
     """
@@ -81,16 +83,33 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
             current_state= torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
 
             # Predicción
-            plans, delta_predictions, scores, cost_function_weights = model(ego, neighbors)
+            if isinstance(model, PredictorVAE):
+                plans, delta_predictions, scores, cost_function_weights, mu, logvar = model(ego, neighbors, ground_truth)
+            else:
+                plans, delta_predictions, scores, cost_function_weights = model(ego, neighbors)
             if False:
                 predictions = current_state[:, 1:, :2].unsqueeze(1).unsqueeze(3) + delta_predictions.cumsum(dim=3)  # (B,M,N,T,2)
             else:
                 predictions = delta_predictions
             # Generar trayectorias de planes
-            plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(NUM_MODES)], dim=1)
+
+            # convierto controles -> trayectorias (por modo)
+            if isinstance(model, PredictorVAE):
+                plan_trajs = torch.stack(
+                    [bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(1)],
+                    dim=1
+                )
+                prediction = predictions[:, 0]  # (B, N, T, 2)
+                plan = plans[:, 0]        # (B, T, 3)
+                
+            else: #Predictor normal de DIPP
+                plan_trajs = torch.stack(
+                    [bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(NUM_MODES)],
+                    dim=1
+                )
             
-            # Seleccionar mejor futuro
-            plan_traj, prediction = select_future(current_state, plan_trajs, delta_predictions, scores)
+                # Seleccionar mejor futuro
+                plan_traj, prediction = select_future(current_state, plan_trajs, delta_predictions, scores)
             
             # Si usamos planning, refinar con el planner
             if use_planning and planner is not None:
@@ -170,7 +189,14 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
                         # Refinar cada uno de los 3 modos con el planner
                         top3_trajs_list   = []
                         top3_nb_pred_list = []
-                        for k in range(3):
+
+                        K = int()
+                        if isinstance(model, PredictorVAE):
+                            K = 1
+                        else:
+                            K = 3
+
+                        for k in range(K):
                             mode_k = top3_modes[k].item()
                             ctrl_k = plans[b:b+1, mode_k]           # (1, 12, 2)
                             pred_k = predictions[b:b+1, mode_k]     # (1, N, 12, 2)
@@ -219,8 +245,8 @@ def evaluate_model(model, data_loader, device, use_planning=False, planner=None,
                         nb_hist_dn    = denorm_xy(nb_hist)
                         nb_pred_dn    = denorm_xy(neighbor_pred[b, :, :, :].cpu().numpy())
                         nb_gt_dn      = denorm_xy(neighbor_gt[b, :, :, :].cpu().numpy())
-                        top3_trajs_dn    = np.stack([denorm_xy(top3_trajs_norm[k])    for k in range(3)], axis=0)
-                        top3_nb_preds_dn = np.stack([denorm_xy(top3_nb_preds_norm[k]) for k in range(3)], axis=0)
+                        top3_trajs_dn    = np.stack([denorm_xy(top3_trajs_norm[k])    for k in range(K)], axis=0)
+                        top3_nb_preds_dn = np.stack([denorm_xy(top3_nb_preds_norm[k]) for k in range(K)], axis=0)
                     else:
                         ego_hist_dn   = ego[b, :, :2].cpu().numpy()
                         ego_pred_dn   = ego_pred[b, :, :].cpu().numpy()
@@ -269,7 +295,7 @@ def main():
     parser.add_argument('--device', type=str, default='cuda', help='Device to use')
     parser.add_argument('--num_vis_samples', type=int, default=20, help='Number of samples to visualize')
     parser.add_argument('--min_neighbors', type=int, default=0, help='Minimum valid neighbors to include a sample in visualization')
-    
+    parser.add_argument('--predictor', type=str, default='Predictor', help='Predictor model type')
     args = parser.parse_args()
     
     # Setup logging
@@ -292,9 +318,16 @@ def main():
     logging.info(f"Device: {args.device}")
     logging.info(f"{'='*60}")
     
+    
     # Cargar modelo
+    if args.predictor == "PredictorVAE":
+        predictor = PredictorVAE(12).to(args.device)
+        NUM_MODES = 1
+    else:
+        predictor = Predictor(12).to(args.device)
+        NUM_MODES = 20
+
     logging.info("Loading model...")
-    predictor = Predictor(12).to(args.device)
     predictor.load_state_dict(torch.load(args.model_path, map_location=args.device))
     predictor.eval()
     logging.info("Model loaded successfully!")
@@ -328,28 +361,28 @@ def main():
                             raw_dataset=test_set)
     
     # Generar visualizaciones
-    if len(results['vis_samples']) > 0:
-        logging.info(f"\n{'='*60}")
-        logging.info("Generating visualizations...")
-        logging.info(f"{'='*60}\n")
+    # if len(results['vis_samples']) > 0:
+    #     logging.info(f"\n{'='*60}")
+    #     logging.info("Generating visualizations...")
+    #     logging.info(f"{'='*60}\n")
         
-        # Visualizaciones de top-3 modos (una imagen con 3 subplots por muestra)
-        for idx, sample in enumerate(results['vis_samples']):
-            if 'ego_top3_trajs' in sample:
-                plot_ego_top3_modes(
-                    ego_hist=sample['ego_hist'],
-                    ego_gt=sample['ego_gt'],
-                    ego_top3_trajs=sample['ego_top3_trajs'],
-                    ego_top3_scores=sample.get('ego_top3_scores', None),
-                    ego_top3_nb_preds=sample.get('ego_top3_nb_preds', None),
-                    neighbors_hist=sample['neighbors_hist'],
-                    neighbors_valid=sample.get('neighbors_valid', None),
-                    neighbors_gt=sample['neighbors_gt'],
-                    save_path=vis_path,
-                    sample_id=idx
-                )
+    #     # Visualizaciones de top-3 modos (una imagen con 3 subplots por muestra)
+    #     for idx, sample in enumerate(results['vis_samples']):
+    #         if 'ego_top3_trajs' in sample:
+    #             plot_ego_top3_modes(
+    #                 ego_hist=sample['ego_hist'],
+    #                 ego_gt=sample['ego_gt'],
+    #                 ego_top3_trajs=sample['ego_top3_trajs'],
+    #                 ego_top3_scores=sample.get('ego_top3_scores', None),
+    #                 ego_top3_nb_preds=sample.get('ego_top3_nb_preds', None),
+    #                 neighbors_hist=sample['neighbors_hist'],
+    #                 neighbors_valid=sample.get('neighbors_valid', None),
+    #                 neighbors_gt=sample['neighbors_gt'],
+    #                 save_path=vis_path,
+    #                 sample_id=idx
+    #             )
         
-        logging.info(f"Visualizations saved to: {vis_path}")
+    #     logging.info(f"Visualizations saved to: {vis_path}")
     
     # Mostrar resultados
     logging.info(f"\n{'='*60}")

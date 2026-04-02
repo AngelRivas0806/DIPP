@@ -7,6 +7,7 @@ import logging
 import os
 import numpy as np
 import subprocess
+import wandb
 
 from torch import nn, optim
 import torch.nn.functional as F  
@@ -14,7 +15,10 @@ from torch.utils.data import DataLoader
 
 from utils.train_utils import *
 from model.planner import MotionPlanner
-from model.predictor import Predictor, NUM_MODES
+from model.predictor import Predictor
+from model.predictorvae import PredictorVAE
+
+
 
 # One training epoch
 def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
@@ -48,7 +52,10 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
 
         # predict
         optimizer.zero_grad()
-        plans, predictions, scores, cost_function_weights = predictor(ego, neighbors)
+        if args.predictor == "PredictorVAE":
+            plans, predictions, scores, cost_function_weights, mu, logvar = predictor(ego, neighbors, ground_truth)
+        else:
+            plans, predictions, scores, cost_function_weights = predictor(ego, neighbors)
 
         if batch_idx == 0:
             weights_to_print = cost_function_weights[0].detach().cpu().numpy()
@@ -59,27 +66,46 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
             print(f"{'='*50}\n")
 
         # convierto controles -> trayectorias (por modo)
-        plan_trajs = torch.stack(
-            [bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(NUM_MODES)],
-            dim=1
-        )
+        # PredictorVAE
+        if args.predictor == "PredictorVAE":
+            plan_trajs = torch.stack(
+                [bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(1)],
+                dim=1
+            )
 
-        # pérdida multi-futuro multi-agente
-        # ego_in_pred_loss=False cuando use_planning: el ego se supervisa via imitation_loss sobre plan optimizado
-        _, pred_loss, score_loss, best_mode = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights,
-                                                         ego_in_pred_loss=not use_planning)
+            _, pred_loss, kl_loss = VAE_loss(plan_trajs, predictions, ground_truth, weights, mu, logvar, ego_in_pred_loss=not use_planning, beta = 1.0)
 
-        # imitacion: ego del modo ganador vs gt — suma
-        best_plan = plan_trajs[torch.arange(plan_trajs.shape[0], device=plan_trajs.device), best_mode]
-        imitation_loss = F.smooth_l1_loss(best_plan[:, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
+            best_plan = plan_trajs[torch.arange(plan_trajs.shape[0], device=plan_trajs.device), 0]
+            imitation_loss = F.smooth_l1_loss(best_plan[:, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
 
-        # sin planning: loss base, cost_weights NO se usan aqui
-        loss = args.lambda_pred * pred_loss + args.lambda_score * score_loss + args.lambda_imitation * imitation_loss
+            loss = args.lambda_pred * pred_loss + args.lambda_score * kl_loss + args.lambda_imitation * imitation_loss
+
+        else: #Predictor normal de DIPP
+            plan_trajs = torch.stack(
+                [bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(NUM_MODES)],
+                dim=1
+            )
+            # pérdida multi-futuro multi-agente
+            # ego_in_pred_loss=False cuando use_planning: el ego se supervisa via imitation_loss sobre plan optimizado
+            _, pred_loss, score_loss, best_mode = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights,
+                                                            ego_in_pred_loss=not use_planning)
+
+            # imitacion: ego del modo ganador vs gt — suma
+            best_plan = plan_trajs[torch.arange(plan_trajs.shape[0], device=plan_trajs.device), best_mode]
+            imitation_loss = F.smooth_l1_loss(best_plan[:, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
+
+            # sin planning: loss base, cost_weights NO se usan aqui
+            loss = args.lambda_pred * pred_loss + args.lambda_score * score_loss + args.lambda_imitation * imitation_loss
+            
 
         # plan
         if use_planning:
             # selecciona el modo ganador para iniciar el optimizador
-            plan, prediction = select_future(plans, predictions, scores)
+            if args.predictor == "PredictorVAE":
+                prediction = predictions[:, 0]  # (B, N, T, 2)
+                plan = plans[:, 0]        # (B, T, 3)
+            else:
+                plan, prediction = select_future(plan_trajs, predictions, scores, best_mode)
 
             planner_inputs = {
                 "control_variables": plan.view(ego.shape[0], 24),
@@ -122,23 +148,30 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
 
             plan_cost = info.last_err.mean() if hasattr(info, "last_err") else 0
 
-            loss = (args.lambda_pred * pred_loss
-                    + args.lambda_score * score_loss
-                    + args.lambda_imitation * imitation_loss
-                    + args.lambda_cost * (cost_reg + w_col * plan_cost))
+            if args.predictor == "PredictorVAE":
+                loss = args.lambda_pred * pred_loss + args.lambda_score * kl_loss + args.lambda_imitation * imitation_loss + args.lambda_cost * (cost_reg + w_col * plan_cost)
+            else:
+                loss = (args.lambda_pred * pred_loss + args.lambda_score * score_loss + args.lambda_imitation * imitation_loss + args.lambda_cost * (cost_reg + w_col * plan_cost))
+
         else:
             # Use the most likely prediction for metrics (no planner)
-            plan, prediction = select_future(current_state, plan_trajs, predictions, scores)
+            if args.predictor == "PredictorVAE":
+                prediction = predictions[:, 0]  # (B, N, T, 2)
+                plan = plan_trajs[:, 0]        # (B, T, 3)
+            else:
+                plan, prediction = select_future(plan_trajs, predictions, scores, best_mode)
 
         # Backpropagation
         loss.backward()
         nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
         optimizer.step()
-
+    
         # metrics
         metrics = motion_metrics(plan, prediction, ground_truth, weights)
         epoch_metrics.append(metrics)
         epoch_loss.append(loss.item())
+
+        
 
         # progress
         current += batch[0].shape[0]
@@ -177,23 +210,29 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
         current_state = torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
         weights = torch.ne(ground_truth[:, 1:, :, :2], 0)
 
+       
+
         with torch.no_grad():
-            plans, predictions, scores, cost_function_weights = predictor(ego, neighbors)
-            plan_trajs = torch.stack(
+             if args.predictor == "PredictorVAE":
+                plans, predictions, scores, cost_function_weights, mu, logvar = predictor(ego, neighbors, ground_truth)
+             else:
+                plans, predictions, scores, cost_function_weights = predictor(ego, neighbors)
+
+             plan_trajs = torch.stack(
                 [bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(NUM_MODES)],
                 dim=1
             )
-            # ego_in_pred_loss=False cuando use_planning: el ego se supervisa via imitation_loss sobre plan optimizado
-            _, pred_loss, score_loss, best_mode = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights,
+             # ego_in_pred_loss=False cuando use_planning: el ego se supervisa via imitation_loss sobre plan optimizado
+             _, pred_loss, score_loss, best_mode = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights,
                                                              ego_in_pred_loss=not use_planning)
 
-            best_plan = plan_trajs[torch.arange(plan_trajs.shape[0], device=plan_trajs.device), best_mode]
-            imitation_loss = F.smooth_l1_loss(best_plan[:, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
-
-            loss = args.lambda_pred * pred_loss + args.lambda_score * score_loss + args.lambda_imitation * imitation_loss
+             best_plan = plan_trajs[torch.arange(plan_trajs.shape[0], device=plan_trajs.device), best_mode]
+             imitation_loss = F.smooth_l1_loss(best_plan[:, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
+ 
+             loss = args.lambda_pred * pred_loss + args.lambda_score * score_loss + args.lambda_imitation * imitation_loss
 
         if use_planning:
-            plan, prediction = select_future(plans, predictions, scores)
+            plan, prediction = select_future(plans, predictions, scores, best_mode)
 
             planner_inputs = {
                 "control_variables": plan.view(ego.shape[0], 24),
@@ -223,7 +262,7 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
                     + args.lambda_imitation * imitation_loss
                     + args.lambda_cost * plan_cost)
         else:
-            plan, prediction = select_future(current_state, plan_trajs, predictions, scores)
+            plan, prediction = select_future(plan_trajs, predictions, scores, best_mode)
 
         metrics = motion_metrics(plan, prediction, ground_truth, weights)
         epoch_metrics.append(metrics)
@@ -265,8 +304,12 @@ def model_training():
     # Set seed
     set_seed(args.seed)
 
-    # predictor
-    predictor = Predictor(12, predict_positions=args.predict_positions).to(args.device)
+    # Predictor o PredictorVAE
+    if args.predictor == "PredictorVAE":
+        predictor = PredictorVAE(12, predict_positions=args.predict_positions).to(args.device)
+        logging.info("Using PredictorVAE model")
+    else:
+        predictor = Predictor(12, predict_positions=args.predict_positions).to(args.device)
 
     # planner
     if args.use_planning:
@@ -301,6 +344,10 @@ def model_training():
     # train loop
     for epoch in range(train_epochs):
         logging.info(f"--- Epoch {epoch+1}/{train_epochs}")
+
+        # """wandb"""
+        # wandb.log({"train/epoch": epoch + 1})
+        # wandb.log({"train/loss": train_loss.item()})
 
         # With a planner, pretrain predictor sin planning
         use_planning_now = args.use_planning
@@ -379,6 +426,7 @@ def model_training():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Training")
     parser.add_argument("--name", type=str, help='log name (default: "Exp1")', default="Exp1")
+    parser.add_argument("--predictor", type=str, help="Predictor PredictorVAE", default="Predictor")
     parser.add_argument("--train_set", type=str, help="path to train datasets", required=True)
     parser.add_argument("--valid_set", type=str, help="path to validation datasets", required=True)
     parser.add_argument("--seed", type=int, help="fix random seed", default=42)
@@ -387,12 +435,7 @@ if __name__ == "__main__":
     parser.add_argument("--train_epochs", type=int, help="epochs of training", default=20)
     parser.add_argument("--batch_size", type=int, help="batch size (default: 32)", default=32)
     parser.add_argument("--learning_rate", type=float, help="learning rate (default: 2e-4)", default=2e-4)
-    parser.add_argument(
-        "--use_planning",
-        action="store_true",
-        help="if use integrated planning module (default: False)",
-        default=False,
-    )
+    parser.add_argument("--use_planning", action="store_true", help="if use integrated planning module (default: False)", default=False)
     parser.add_argument("--device", type=str, help="run on which device (default: cuda)", default="cuda")
     parser.add_argument("--lambda_pred",       type=float, default=0.7,  help="peso perdida de prediccion")
     parser.add_argument("--lambda_score",      type=float, default=1.0,  help="peso perdida de score")
@@ -407,6 +450,18 @@ if __name__ == "__main__":
         # normaliza "cuda" -> "cuda:0"
         if args.device == "cuda":
             args.device = "cuda:0"
+    
+    if args.predictor == "PredictorVAE":
+        NUM_MODES = 1
+    else:
+        NUM_MODES = 20
+
+    """WANDB"""
+
+    wandb.init(project="DIPP(primera prueba)", name=args.name)
+    wandb.config.update(args)
 
     # Main training function
     model_training()
+
+    wandb.finish()

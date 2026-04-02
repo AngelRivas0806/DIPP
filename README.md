@@ -45,6 +45,7 @@ Posteriormente si quieres visualizar tus datos ejecuta:
 python vis.py --npz DIPP_model/data/train/data.npz --random --ego_frame --rotate
 ```
 ### 2.1 DIPP_model train (Whitout planning)
+If you want to use the predictorVAE use the flag -- predictor PredictorVAE
 ```shell
 python DIPP_model/train.py \
   --name Exp1_noplan \
@@ -56,6 +57,7 @@ python DIPP_model/train.py \
 ```
 
 ### 2.2 DIPP_model train (Integrated planning)
+If you want to use the predictorVAE use the flag -- predictor PredictorVAE
 ```shell
 python DIPP_model/train.py \
   --name Exp1_plan \

@@ -2,8 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-# Número de modos
-NUM_MODES = 20
+NUM_MODES = 20  # número de modos de predicción (futuras posibles trayectorias)
 
 """
 Agent history encoder
@@ -112,6 +111,7 @@ class AgentDecoder(nn.Module):
         # decoded: (B, M, N, T, 2)
         decoded = self.decode(agent_agent).view(B, self._num_modes, self._num_neighbors, self._future_steps, 2)
         trajs = self.transform(decoded, current_state)  # (B, M, N, T, 2)
+        
         return trajs
 
 
@@ -210,9 +210,9 @@ class Predictor(nn.Module):
         plans, cost_function_weights = self.plan_net(ego_modes)
         current_state_neighbors = neighbors[:, :, -1, :]
 
+
         # agent_agent[:, :, 1:] → (B, num_modes, num_neighbors, 256)
-        predictions = self.predict(
-            agent_agent[:, :, 1:],      # embeddings por modo de vecinos
+        predictions = self.predict(       agent_agent[:, :, 1:],      # embeddings por modo de vecinos
             current_state_neighbors     # estado actual de vecinos
         )
         # predictions: (B, num_modes, num_neighbors, future_steps, 3)
