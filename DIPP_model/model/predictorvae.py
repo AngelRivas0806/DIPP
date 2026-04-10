@@ -130,6 +130,7 @@ class PredictorVAE(nn.Module):
         self.posterior_distribution = mlp_gaussian(input_dim=embed_dim*2, hidden_dim=256, output_dim=64)  # (B, 64) -> (B, 32) for mu and (B, 32) for logvar
         self.reparametrization_train = reparametrization()
         self.score          = Score(num_modes=1, tokens_dim=embed_dim)  # Scoring module for the modes (B, N) - optional, can be used for mode selection or as an auxiliary loss
+        
     def forward(self, ego, neighbors, ground_truth):
         """
         ego:       (B, T_obs, feat_dim)          
@@ -201,9 +202,9 @@ class PredictorVAE(nn.Module):
         predictions = self.neighbor_decoder(neighbor_conditioned, current_state_neighbors)  # (B,N,T,2)
         predictions = predictions.unsqueeze(1)  # (B,1,N,T,2)
 
-        scores = self.score(agent_agent)  # (B,N)
+        # scores = self.score(agent_agent)  # (B,N)
 
-        return plans, predictions, scores, cost_function_weights, posterior_mu, posterior_logvar
+        return plans, predictions, cost_function_weights, posterior_mu, posterior_logvar
 
 
 if __name__ == "__main__":

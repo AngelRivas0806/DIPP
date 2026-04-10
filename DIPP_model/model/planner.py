@@ -222,7 +222,7 @@ class MotionPlanner:
         else:
             self.optimizer = th.GaussNewton(
                 objective, th.LUDenseSolver,
-                vectorize=False, max_iterations=10, step_size=0.3
+                vectorize=False, max_iterations=5, step_size=0.3
             )
 
         self.layer = th.TheseusLayer(self.optimizer, vectorize=False)

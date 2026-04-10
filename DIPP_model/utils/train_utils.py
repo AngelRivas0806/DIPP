@@ -229,12 +229,14 @@ def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Opti
     score_loss = F.cross_entropy(scores, best_mode)
 
     # Seleccionar modo ganador
-    best_mode_plan = plans[torch.arange(B, device=plans.device), best_mode]               # (B,T,3)
+    best_mode_plan = plans[torch.arange(B, device=plans.device), best_mode]               # (B,T,C)
     best_mode_pred = predictions_masked[torch.arange(B, device=plans.device), best_mode]  # (B,N,T,2)
 
-    dummy_theta      = torch.zeros_like(best_mode_pred[:, :, :, :1])
-    best_mode_pred_3d= torch.cat([best_mode_pred, dummy_theta], dim=-1)
-    prediction_all   = torch.cat([best_mode_plan.unsqueeze(1), best_mode_pred_3d], dim=1)  # (B,1+N,T,3)
+    # Trabajar solo con xy
+    best_mode_plan_xy = best_mode_plan[:, :, :2]     # (B,T,2)
+    best_mode_pred_xy = best_mode_pred[:, :, :, :2]  # (B,N,T,2)
+
+    prediction_all   = torch.cat([best_mode_plan_xy.unsqueeze(1), best_mode_pred_xy], dim=1)  # (B,1+N,T,3)
 
     # ---- pred_loss sobre modo ganador: suma de errores (sin promediar)
 
