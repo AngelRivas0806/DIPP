@@ -52,14 +52,14 @@ class MultiModalTransformer(nn.Module):
 Agent2Agent
 Module that models the interactions between agents using a transformer encoder.
 """
-class Agent2Agent(nn.Module):
+class Agent2AgentVAE(nn.Module):
     def __init__(self, modes: int, tokens_dim: int):
-        super(Agent2Agent, self).__init__()
+        super(Agent2AgentVAE, self).__init__()
         self.modes = modes
         
         # Encoder to process interactions between agents
         # TODO: test different numbers of heads, feedforward dimensions, activation functions, number of layers.
-        encoder_layer = nn.TransformerEncoderLayer(d_model=tokens_dim, nhead=8, dim_feedforward=1024, activation='relu', batch_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=tokens_dim, nhead=4, dim_feedforward=1024, activation='relu', batch_first=True)
         self.interaction_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
         
     def forward(self, inputs, mask=None):
@@ -72,7 +72,33 @@ class Agent2Agent(nn.Module):
             noise = torch.randn_like(output[:, :1, :, :]) * 0.1 
             output= output + noise
         return output
-    
+
+class Agent2Agent(nn.Module):
+    def __init__(self, modes: int, tokens_dim: int):
+        super(Agent2Agent, self).__init__()
+        self.modes = modes
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=tokens_dim,
+            nhead=4,
+            dim_feedforward=1024,
+            activation='relu',
+            batch_first=True
+        )
+        self.interaction_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
+
+    def forward(self, inputs, mask=None):
+        # (B, A, E)
+        encoded = self.interaction_net(inputs, src_key_padding_mask=mask)
+
+        # (B, M, A, E)
+        output = encoded.unsqueeze(1).expand(-1, self.modes, -1, -1).clone()
+
+        # ruido distinto por modo para romper el colapso
+        noise = torch.randn_like(output) * 0.1
+        output = output + noise
+
+        return output
 
 """
 AgentDecoder

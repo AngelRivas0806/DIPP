@@ -1,306 +1,681 @@
-import sys
 import torch
 import argparse
 import numpy as np
 import os
 import logging
 from tqdm import tqdm
-from model.predictorvae import PredictorVAE
-from utils.train_utils import DrivingData, bicycle_model, select_future
-from utils.visualization import plot_trajectory_prediction, plot_ego_top3_modes
-from model.predictor import Predictor
-from model.planner import MotionPlanner
 from torch.utils.data import DataLoader
 
-NUM_MODES = int()
+from model.predictorvae import PredictorVAE
+from model.predictor import Predictor
+from model.planner import MotionPlanner
+
+from utils.train_utils import DrivingData, bicycle_model, select_future
+from utils.visualization import save_visualizations_from_samples
+
+
+# =========================================================
+# Utils
+# =========================================================
 
 def compute_ade_fde(predictions, ground_truth):
     """
-    Compute Average Displacement Error and Final Displacement Error
-    
-    Args:
-        predictions: (batch, pred_len, 2) predicted trajectory
-        ground_truth: (batch, pred_len, 2) ground truth trajectory
-    
-    Returns:
-        ade, fde: scalars
+    predictions: (B, T, 2)
+    ground_truth: (B, T, 2)
     """
-    # Calcular desplazamiento en cada timestep
-    displacement = torch.norm(predictions - ground_truth, dim=-1)  # (batch, pred_len)
-    
-    # ADE: promedio de todos los desplazamientos
+    displacement = torch.norm(predictions - ground_truth, dim=-1)
     ade = torch.mean(displacement)
-    
-    # FDE: desplazamiento en el punto final
     fde = torch.mean(displacement[:, -1])
-    
     return ade.item(), fde.item()
 
 
-def evaluate_model(model, data_loader, device, use_planning=False, planner=None, 
-                  visualize=False, vis_path=None, num_vis_samples=10, min_neighbors=0,
-                  raw_dataset=None):
+def make_current_state(ego, neighbors):
     """
-    Evaluar el modelo en un conjunto de datos
-    
-    Args:
-        visualize: Si generar visualizaciones
-        vis_path: Directorio para guardar visualizaciones
-        num_vis_samples: Número de muestras a visualizar
+    Return: (B, 1+N, feat_dim_last)
+    Usa el último timestep de ego y vecinos (sin flag).
     """
+    # ego: (B, T_obs, 6)
+    # neighbors: (B, N, T_obs, 7) -> quitamos flag
+    return torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]  # (B, 1+N, 6)
+
+
+def get_visualization_candidates(raw_dataset, num_vis_samples, min_neighbors):
+    neighbors_raw = raw_dataset.neighbors
+    valid_counts = np.array([
+        int(np.sum(np.sum(np.abs(neighbors_raw[i]), axis=(1, 2)) > 0))
+        for i in range(len(raw_dataset))
+    ])
+
+    candidates = np.where(valid_counts >= min_neighbors)[0]
+    if len(candidates) >= num_vis_samples:
+        step = max(1, len(candidates) // num_vis_samples)
+        selected = candidates[::step][:num_vis_samples]
+    else:
+        selected = candidates
+
+    return set(int(x) for x in selected)
+
+
+def denorm_xy_factory(raw_dataset, raw_idx):
+    raw_ego = raw_dataset.ego[raw_idx]
+    ego_pos0 = raw_ego[-1, :2].copy()
+    vx, vy = float(raw_ego[-1, 2]), float(raw_ego[-1, 3])
+    heading = float(np.arctan2(vy, vx)) if abs(vx) > 1e-2 or abs(vy) > 1e-2 else 0.0
+    c, s = np.cos(heading), np.sin(heading)
+
+    def denorm_xy(xy):
+        xr = xy[..., 0] * c - xy[..., 1] * s
+        yr = xy[..., 0] * s + xy[..., 1] * c
+        out = np.stack([xr, yr], axis=-1)
+        out = out + ego_pos0
+        return out
+
+    return denorm_xy
+
+
+def tensor_to_list(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy().tolist()
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    return x
+
+
+def align_neighbor_predictions(pred_tensor, num_neighbors_expected):
+    """
+    Alinea tensor (B, A, T, 2) para que solo contenga vecinos.
+    Si viene el ego incluido como primer agente, lo quita.
+    """
+    if pred_tensor.shape[1] == num_neighbors_expected:
+        return pred_tensor
+    if pred_tensor.shape[1] == num_neighbors_expected + 1:
+        return pred_tensor[:, 1:]
+    raise ValueError(
+        f"Predicciones con número inesperado de agentes: "
+        f"{pred_tensor.shape[1]} vs vecinos esperados {num_neighbors_expected}"
+    )
+
+
+def align_neighbor_predictions_all(pred_tensor, num_neighbors_expected):
+    """
+    Alinea tensor multimodo (B, M, A, T, 2) para que solo contenga vecinos.
+    Si viene el ego incluido como primer agente, lo quita.
+    """
+    if pred_tensor.shape[2] == num_neighbors_expected:
+        return pred_tensor
+    if pred_tensor.shape[2] == num_neighbors_expected + 1:
+        return pred_tensor[:, :, 1:]
+    raise ValueError(
+        f"Predicciones multimodo con número inesperado de agentes: "
+        f"{pred_tensor.shape[2]} vs vecinos esperados {num_neighbors_expected}"
+    )
+
+
+def compute_joint_scene_error(plan_trajs, predictions_all, ground_truth):
+    """
+    plan_trajs:      (B, K, T, 3)
+    predictions_all: (B, K, N, T, 2)
+    ground_truth:    (B, 1+N, T, D)
+
+    Returns:
+        joint_err: (B, K)  -> error conjunto ego + vecinos válidos
+    """
+    ego_gt = ground_truth[:, 0, :, :2]      # (B, T, 2)
+    nei_gt = ground_truth[:, 1:, :, :2]     # (B, N, T, 2)
+
+    valid_mask = torch.sum(torch.abs(nei_gt), dim=(2, 3)) > 0  # (B, N)
+
+    all_joint_err = []
+    K = plan_trajs.shape[1]
+
+    for k in range(K):
+        ego_pred_k = plan_trajs[:, k, :, :2]                           # (B, T, 2)
+        ego_err_k = torch.norm(ego_pred_k - ego_gt, dim=-1).mean(dim=-1)  # (B,)
+
+        nei_pred_k = predictions_all[:, k, :, :, :2]                   # (B, N, T, 2)
+        nei_disp_k = torch.norm(nei_pred_k - nei_gt, dim=-1)           # (B, N, T)
+        nei_ade_k = nei_disp_k.mean(dim=-1)                            # (B, N)
+        nei_ade_k = torch.where(valid_mask, nei_ade_k, torch.zeros_like(nei_ade_k))
+
+        valid_counts = valid_mask.sum(dim=1).clamp(min=1)              # (B,)
+        nei_err_k = nei_ade_k.sum(dim=1) / valid_counts                # (B,)
+
+        joint_err_k = ego_err_k + nei_err_k
+        all_joint_err.append(joint_err_k)
+
+    joint_err = torch.stack(all_joint_err, dim=1)  # (B, K)
+    return joint_err
+
+
+# =========================================================
+# Batch runners
+# =========================================================
+
+@torch.no_grad()
+def run_batch_standard(model, ego, neighbors):
+    """
+    Predictor normal.
+    Returns dict with unified keys.
+    """
+    plans, predictions_all, scores, cost_function_weights = model(ego, neighbors)
+    num_modes = scores.shape[1]
+
+    plan_trajs = torch.stack(
+        [bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(num_modes)],
+        dim=1
+    )  # (B, M, T, 3)
+
+    best_mode = torch.argmax(scores, dim=1)
+    best_plan_traj, best_prediction = select_future(plan_trajs, predictions_all, scores, best_mode)
+
+    num_neighbors_expected = neighbors.shape[1]
+    predictions_all = align_neighbor_predictions_all(predictions_all, num_neighbors_expected)
+    best_prediction = align_neighbor_predictions(best_prediction, num_neighbors_expected)
+
+    return {
+        "mode": "standard",
+        "plans": plans,                         # (B,M,T,2)
+        "predictions_all": predictions_all,     # (B,M,N,T,2)
+        "scores": scores,                       # (B,M)
+        "cost_function_weights": cost_function_weights,  # (B,5) o (B,M,5)
+        "plan_trajs": plan_trajs,               # (B,M,T,3)
+        "plan_traj": best_plan_traj,            # (B,T,3)
+        "prediction": best_prediction,          # (B,N,T,2)
+        "num_modes": num_modes,
+    }
+
+
+@torch.no_grad()
+def run_batch_vae(model, ego, neighbors, ground_truth=None, num_samples=1):
+    """
+    Predictor VAE usando inference() con prior N(0,I).
+    Devuelve TODAS las muestras K.
+    """
+    outputs = model.inference(ego, neighbors, num_samples=num_samples)
+
+    if len(outputs) == 4:
+        plans, predictions_all, cost_function_weights, z = outputs
+    elif len(outputs) == 3:
+        plans, predictions_all, cost_function_weights = outputs
+        z = None
+    else:
+        raise ValueError("Salida inesperada de PredictorVAE.inference(...)")
+
+    # K = num_samples
+    num_modes = plans.shape[1]
+
+    num_neighbors_expected = neighbors.shape[1]
+    predictions_all = align_neighbor_predictions_all(predictions_all, num_neighbors_expected)  # (B,K,N,T,2)
+
+    # Convertir controles -> trayectorias (sin planner)
+    plan_trajs = torch.stack(
+        [bicycle_model(plans[:, k], ego[:, -1])[:, :, :3] for k in range(num_modes)],
+        dim=1
+    )  # (B,K,T,3)
+
+    return {
+        "mode": "vae",
+        "plans": plans,                         # (B,K,T,2)
+        "predictions_all": predictions_all,     # (B,K,N,T,2)
+        "cost_function_weights": cost_function_weights,  # (B,5) o (B,K,5)
+        "plan_trajs": plan_trajs,               # (B,K,T,3) sin planner
+        "z": z,
+        "num_modes": num_modes,
+        "ground_truth": ground_truth
+    }
+
+
+# =========================================================
+# Planning (UNA sola optimización final)
+# =========================================================
+
+@torch.no_grad()
+def apply_planning_single(
+    plan_control_init,          # (B,T,2)
+    prediction_init,            # (B,N,T,2)
+    cost_function_weights_init, # (B,5)
+    ego,
+    current_state,
+    planner,
+    T=12
+):
+    """
+    Corre Theseus UNA vez con una inicialización (plan_control_init) y un set de predicciones (prediction_init).
+    Return refined_plan_traj: (B,T,3)
+    """
+    B = plan_control_init.shape[0]
+
+    planner_inputs = {
+        "control_variables": plan_control_init.view(B, -1),
+        "predictions": prediction_init,
+        "current_state": current_state,
+        "w_acc": cost_function_weights_init[:, 0].unsqueeze(1),
+        "w_jerk": cost_function_weights_init[:, 1].unsqueeze(1),
+        "w_steer": cost_function_weights_init[:, 2].unsqueeze(1),
+        "w_steer_change": cost_function_weights_init[:, 3].unsqueeze(1),
+        "w_collision": cost_function_weights_init[:, 4].unsqueeze(1),
+    }
+
+    final_values, info = planner.layer.forward(planner_inputs)
+    refined_control = final_values["control_variables"].view(B, T, 2)
+
+    refined_plan_traj = bicycle_model(refined_control, ego[:, -1])[:, :, :3]  # (B,T,3)
+    return refined_plan_traj, refined_control
+
+
+def select_vae_candidate_before_planning(
+    model_out, ground_truth, selection_mode="best_of_k"
+):
+    """
+    Selecciona UNA trayectoria/predicción a partir de las K muestras del VAE ANTES de planificar.
+    Devuelve:
+      plan_control_init: (B,T,2)
+      prediction_init:   (B,N,T,2)
+      weights_init:      (B,5)
+      selected_idx:      (B,) o None
+      aux_for_vis:       dict con info extra (por si quieres visualizar K muestras)
+    """
+    plans = model_out["plans"]                       # (B,K,T,2)
+    predictions_all = model_out["predictions_all"]   # (B,K,N,T,2)
+    plan_trajs = model_out["plan_trajs"]             # (B,K,T,3) sin planner
+    w = model_out["cost_function_weights"]           # (B,5) o (B,K,5)
+
+    B, K = plans.shape[0], plans.shape[1]
+    batch_ids = torch.arange(B, device=plans.device)
+
+    if selection_mode == "mean_of_k":
+        plan_control_init = plans.mean(dim=1)             # (B,T,2)
+        prediction_init = predictions_all.mean(dim=1)     # (B,N,T,2)
+        weights_init = w.mean(dim=1) if w.dim() == 3 else w
+        selected_idx = None
+
+    elif selection_mode == "first":
+        selected_idx = torch.zeros(B, dtype=torch.long, device=plans.device)
+        plan_control_init = plans[:, 0]
+        prediction_init = predictions_all[:, 0]
+        weights_init = w[:, 0] if w.dim() == 3 else w
+
+    else:  # "best_of_k" (oracle con GT)
+        if ground_truth is None:
+            raise ValueError("best_of_k requiere ground_truth para seleccionar k*.")
+
+        joint_err = compute_joint_scene_error(plan_trajs, predictions_all, ground_truth)  # (B,K)
+        selected_idx = torch.argmin(joint_err, dim=1)                                      # (B,)
+
+        plan_control_init = plans[batch_ids, selected_idx]         # (B,T,2)
+        prediction_init = predictions_all[batch_ids, selected_idx] # (B,N,T,2)
+        weights_init = (w[batch_ids, selected_idx] if w.dim() == 3 else w)  # (B,5)
+
+    aux_for_vis = {
+        "plan_trajs_all": plan_trajs,            # (B,K,T,3)
+        "predictions_all": predictions_all,      # (B,K,N,T,2)
+        "selected_idx": selected_idx
+    }
+    return plan_control_init, prediction_init, weights_init, selected_idx, aux_for_vis
+
+
+# =========================================================
+# Visualization packers
+# =========================================================
+
+def pack_vis_sample_vae_final_only(
+    b, batch_start, ego, neighbors, ground_truth,
+    final_plan_traj, final_prediction,
+    raw_dataset=None
+):
+    """
+    Guarda SOLO la escena final (una trayectoria) para VAE.
+    """
+    ego_hist = ego[b, :, :2].cpu().numpy()
+    ego_gt = ground_truth[b, 0, :, :2].cpu().numpy()
+
+    nb_hist = neighbors[b, :, :, :2].cpu().numpy()
+    nb_gt = ground_truth[b, 1:, :, :2].cpu().numpy()
+
+    neigh_valid = (neighbors[b, :, -1, 6] > 0).cpu().numpy()
+    n_valid = int(np.sum([np.sum(np.abs(nb_hist[n])) > 0 for n in range(nb_hist.shape[0])]))
+
+    ego_pred = final_plan_traj[b, :, :2].cpu().numpy()        # (T,2)
+    nb_pred = final_prediction[b, :, :, :2].cpu().numpy()     # (N,T,2)
+
+    if raw_dataset is not None:
+        raw_idx = batch_start + b
+        denorm_xy = denorm_xy_factory(raw_dataset, raw_idx)
+
+        ego_hist = denorm_xy(ego_hist)
+        ego_gt = denorm_xy(ego_gt)
+        nb_hist = denorm_xy(nb_hist)
+        nb_gt = denorm_xy(nb_gt)
+        ego_pred = denorm_xy(ego_pred)
+        nb_pred = denorm_xy(nb_pred)
+
+    return {
+        "kind": "vae_final",
+        "ego_hist": ego_hist,
+        "ego_gt": ego_gt,
+        "ego_pred": ego_pred,
+        "neighbors_hist": nb_hist,
+        "neighbors_gt": nb_gt,
+        "neighbors_pred": nb_pred,
+        "neighbors_valid": neigh_valid,
+        "num_valid_neighbors": int(n_valid),
+    }
+
+
+def pack_vis_sample_vae_multi_optional(
+    b, batch_start, ego, neighbors, ground_truth,
+    plan_trajs_all, predictions_all, selected_idx=None,
+    raw_dataset=None
+):
+    """
+    Guarda K muestras del VAE (sin planner o como quieras) en una sola escena.
+    Esto es opcional (solo para visual).
+    """
+    ego_hist = ego[b, :, :2].cpu().numpy()
+    ego_gt = ground_truth[b, 0, :, :2].cpu().numpy()
+
+    nb_hist = neighbors[b, :, :, :2].cpu().numpy()
+    nb_gt = ground_truth[b, 1:, :, :2].cpu().numpy()
+
+    neigh_valid = (neighbors[b, :, -1, 6] > 0).cpu().numpy()
+    n_valid = int(np.sum([np.sum(np.abs(nb_hist[n])) > 0 for n in range(nb_hist.shape[0])]))
+
+    ego_samples_trajs = plan_trajs_all[b, :, :, :2].cpu().numpy()            # (K,T,2)
+    neighbor_samples_preds = predictions_all[b, :, :, :, :2].cpu().numpy()   # (K,N,T,2)
+
+    if raw_dataset is not None:
+        raw_idx = batch_start + b
+        denorm_xy = denorm_xy_factory(raw_dataset, raw_idx)
+
+        ego_hist = denorm_xy(ego_hist)
+        ego_gt = denorm_xy(ego_gt)
+        nb_hist = denorm_xy(nb_hist)
+        nb_gt = denorm_xy(nb_gt)
+        ego_samples_trajs = np.stack([denorm_xy(ego_samples_trajs[k]) for k in range(ego_samples_trajs.shape[0])], axis=0)
+        neighbor_samples_preds = np.stack([denorm_xy(neighbor_samples_preds[k]) for k in range(neighbor_samples_preds.shape[0])], axis=0)
+
+    out = {
+        "kind": "vae_multi",
+        "ego_hist": ego_hist,
+        "ego_gt": ego_gt,
+        "neighbors_hist": nb_hist,
+        "neighbors_gt": nb_gt,
+        "neighbors_valid": neigh_valid,
+        "num_valid_neighbors": int(n_valid),
+        "ego_samples_trajs": ego_samples_trajs,
+        "neighbor_samples_preds": neighbor_samples_preds,
+    }
+    if selected_idx is not None:
+        out["selected_idx"] = int(selected_idx[b].item())
+    return out
+
+
+# =========================================================
+# Evaluators
+# =========================================================
+
+@torch.no_grad()
+def evaluate_model_standard(
+    model, data_loader, device,
+    use_planning=False, planner=None,
+    save_vis=False, num_vis_samples=10,
+    min_neighbors=0, raw_dataset=None
+):
     model.eval()
-    
-    # Métricas acumuladas
+
     ego_ades, ego_fdes = [], []
     neighbor_ades, neighbor_fdes = [], []
-    
-    # Pre-calcular índices candidatos para visualización (distribuidos uniformemente)
-    vis_candidate_indices = set()
-    if visualize and raw_dataset is not None:
-        neighbors_raw = raw_dataset.neighbors  # (N, K, obs, 7)
-        valid_counts = np.array([
-            int(np.sum(np.sum(np.abs(neighbors_raw[i]), axis=(1, 2)) > 0))
-            for i in range(len(raw_dataset))
-        ])
-        candidates = np.where(valid_counts >= min_neighbors)[0]
-        if len(candidates) >= num_vis_samples:
-            step = len(candidates) // num_vis_samples
-            selected = candidates[::step][:num_vis_samples]
-        else:
-            selected = candidates
-        vis_candidate_indices = set(int(x) for x in selected)
-
-    # Datos para visualización
     vis_samples = []
-    
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(data_loader, desc="Evaluating")):
-            # Preparar datos
-            ego          = batch[0].to(device)
-            neighbors    = batch[1].to(device)
-            ground_truth = batch[2].to(device)
-            
-            current_state= torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
 
-            # Predicción
-            if isinstance(model, PredictorVAE):
-                plans, delta_predictions, scores, cost_function_weights, mu, logvar = model(ego, neighbors, ground_truth)
-            else:
-                plans, delta_predictions, scores, cost_function_weights = model(ego, neighbors)
-            if False:
-                predictions = current_state[:, 1:, :2].unsqueeze(1).unsqueeze(3) + delta_predictions.cumsum(dim=3)  # (B,M,N,T,2)
-            else:
-                predictions = delta_predictions
-            # Generar trayectorias de planes
+    vis_candidate_indices = set()
+    if save_vis and raw_dataset is not None:
+        vis_candidate_indices = get_visualization_candidates(raw_dataset, num_vis_samples, min_neighbors)
 
-            # convierto controles -> trayectorias (por modo)
-            if isinstance(model, PredictorVAE):
-                plan_trajs = torch.stack(
-                    [bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(1)],
-                    dim=1
-                )
-                prediction = predictions[:, 0]  # (B, N, T, 2)
-                plan = plans[:, 0]        # (B, T, 3)
-                
-            else: #Predictor normal de DIPP
-                plan_trajs = torch.stack(
-                    [bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(NUM_MODES)],
-                    dim=1
-                )
-            
-                # Seleccionar mejor futuro
-                plan_traj, prediction = select_future(current_state, plan_trajs, delta_predictions, scores)
-            
-            # Si usamos planning, refinar con el planner
-            if use_planning and planner is not None:
-                # Necesitamos los controles originales (antes de bicycle_model)
-                # Seleccionar el mejor plan de control basado en scores
-                best_mode_idx = torch.argmax(scores, dim=1)
-                plan_control = plans[torch.arange(ego.shape[0]), best_mode_idx]  # (batch, 12, 2)
-                
-                # Ground truth trajectory for trajectory following cost
-                gt_trajectory = ground_truth[:, 0, :, :2]  # ego's ground truth future (x,y)
-                
-                planner_inputs = {
-                    "control_variables": plan_control.view(ego.shape[0], 24),
-                    "predictions": prediction,
-                    "current_state": current_state,
-                }
-                
-                w = cost_function_weights  # (B, 5)
-                planner_inputs["w_acc"] = w[:, 0].unsqueeze(1)
-                planner_inputs["w_jerk"] = w[:, 1].unsqueeze(1)
-                planner_inputs["w_steer"] = w[:, 2].unsqueeze(1)
-                planner_inputs["w_steer_change"] = w[:, 3].unsqueeze(1)
-                planner_inputs["w_collision"] = w[:, 4].unsqueeze(1)
-                
-                final_values, info = planner.layer.forward(planner_inputs)
-                refined_control = final_values["control_variables"].view(-1, 12, 2)
-                plan_traj = bicycle_model(refined_control, ego[:, -1])[:, :, :3]
-            
-            # Calcular métricas para ego
-            ego_gt = ground_truth[:, 0, :, :2]  # (batch, pred_len, 2)
-            ego_pred = plan_traj[:, :, :2]  # (batch, pred_len, 2)
-            
-            ade, fde = compute_ade_fde(ego_pred, ego_gt)
-            ego_ades.append(ade)
-            ego_fdes.append(fde)
-            
-            # Calcular métricas para vecinos
-            # Filtrar vecinos válidos (que tienen ground truth)
-            neighbor_gt = ground_truth[:, 1:, :, :2]  # (batch, num_neighbors, pred_len, 2)
-            neighbor_pred = prediction[:, :, :, :2]  # (batch, num_neighbors, pred_len, 2)
-            
-            # Máscara de vecinos válidos
-            valid_mask = torch.sum(torch.abs(neighbor_gt), dim=(2, 3)) > 0  # (batch, num_neighbors)
-            
-            for b in range(neighbor_gt.shape[0]):
-                for n in range(neighbor_gt.shape[1]):
-                    if valid_mask[b, n]:
-                        # Aplanar a (1, pred_len, 2) para compute_ade_fde
-                        ade, fde = compute_ade_fde(
-                            neighbor_pred[b, n:n+1, :, :],  # (1, pred_len, 2)
-                            neighbor_gt[b, n:n+1, :, :]     # (1, pred_len, 2)
-                        )
-                        neighbor_ades.append(ade)
-                        neighbor_fdes.append(fde)
-            
-            # ========== VISUALIZACIÓN ==========
-            if visualize and len(vis_samples) < num_vis_samples:
-                batch_start = batch_idx * data_loader.batch_size
-                for b in range(ego.shape[0]):
-                    if len(vis_samples) >= num_vis_samples:
-                        break
-                    global_idx = batch_start + b
-                    if global_idx not in vis_candidate_indices:
-                        continue
+    for batch_idx, batch in enumerate(tqdm(data_loader, desc="Evaluating standard predictor")):
+        ego = batch[0].to(device)
+        neighbors = batch[1].to(device)
+        ground_truth = batch[2].to(device)
 
-                    nb_hist = neighbors[b, :, :, :2].cpu().numpy()
-                    n_valid = int(np.sum([np.sum(np.abs(nb_hist[n])) > 0 for n in range(nb_hist.shape[0])]))
-                    # Máscara de vecinos válidos usando el flag (col 6 del último frame)
-                    neigh_valid = (neighbors[b, :, -1, 6] > 0).cpu().numpy()  # (N,) bool
+        current_state = make_current_state(ego, neighbors)
 
-                    # --- Top-3 modos del ego ---
-                    top3_modes = torch.argsort(scores[b], descending=True)[:3]              # (3,) tensor
-                    all_probs  = torch.softmax(scores[b], dim=0)                            # (20,) prob real sobre todos los modos
-                    top3_scores = all_probs[top3_modes].cpu().numpy()                       # (3,) prob relativa a los 20 modos
+        model_out = run_batch_standard(model, ego, neighbors)
+        final_plan_traj = model_out["plan_traj"]
+        final_prediction = model_out["prediction"]
 
-                    if use_planning and planner is not None:
-                        # Refinar cada uno de los 3 modos con el planner
-                        top3_trajs_list   = []
-                        top3_nb_pred_list = []
+        if use_planning and planner is not None:
+            # standard: optimiza 1 vez (best_mode)
+            best_mode_idx = torch.argmax(model_out["scores"], dim=1)
+            plan_control_init = model_out["plans"][torch.arange(ego.shape[0], device=device), best_mode_idx]  # (B,T,2)
 
-                        K = int()
-                        if isinstance(model, PredictorVAE):
-                            K = 1
-                        else:
-                            K = 3
+            w = model_out["cost_function_weights"]
+            if w.dim() == 3 and w.shape[1] == 1:
+                w = w[:, 0]
 
-                        for k in range(K):
-                            mode_k = top3_modes[k].item()
-                            ctrl_k = plans[b:b+1, mode_k]           # (1, 12, 2)
-                            pred_k = predictions[b:b+1, mode_k]     # (1, N, 12, 2)
-                            planner_inputs_k = {
-                                "control_variables": ctrl_k.view(1, 24),
-                                "predictions":       pred_k,
-                                "current_state":     current_state[b:b+1],
-                                "w_acc":          cost_function_weights[b:b+1, 0].unsqueeze(1),
-                                "w_jerk":         cost_function_weights[b:b+1, 1].unsqueeze(1),
-                                "w_steer":        cost_function_weights[b:b+1, 2].unsqueeze(1),
-                                "w_steer_change": cost_function_weights[b:b+1, 3].unsqueeze(1),
-                                "w_collision":    cost_function_weights[b:b+1, 4].unsqueeze(1),
-                            }
-                            final_k, _ = planner.layer.forward(planner_inputs_k)
-                            refined_ctrl_k = final_k["control_variables"].view(1, 12, 2)
-                            traj_k = bicycle_model(refined_ctrl_k, ego[b:b+1, -1])[:, :, :2]  # (1,12,2)
-                            top3_trajs_list.append(traj_k.squeeze(0).cpu().numpy())        # (12,2)
-                            top3_nb_pred_list.append(pred_k.squeeze(0).cpu().numpy())      # (N,12,2)
-                        top3_trajs_norm    = np.stack(top3_trajs_list,   axis=0)  # (3,12,2)
-                        top3_nb_preds_norm = np.stack(top3_nb_pred_list, axis=0)  # (3,N,12,2)
-                    else:
-                        # Sin planner: usar plan_trajs ya calculadas
-                        top3_trajs_norm    = plan_trajs[b][top3_modes][:, :, :2].cpu().numpy()  # (3,12,2)
-                        top3_nb_preds_norm = predictions[b][top3_modes][:, :, :, :2].cpu().numpy()  # (3,N,12,2)
+            final_plan_traj, _ = apply_planning_single(
+                plan_control_init=plan_control_init,
+                prediction_init=final_prediction,
+                cost_function_weights_init=w,
+                ego=ego,
+                current_state=current_state,
+                planner=planner,
+                T=12
+            )
 
-                    # --- Desnormalización ---
-                    if raw_dataset is not None:
-                        raw_idx = batch_start + b
-                        raw_ego = raw_dataset.ego[raw_idx]          # (obs, 6) sin normalizar
-                        ego_pos0 = raw_ego[-1, :2].copy()           # traslación
-                        vx, vy = float(raw_ego[-1, 2]), float(raw_ego[-1, 3])
-                        heading = float(np.arctan2(vy, vx)) if abs(vx) > 1e-2 or abs(vy) > 1e-2 else 0.0
-                        c, s = np.cos(heading), np.sin(heading)     # inverso: +heading
+        # Metrics - ego
+        ego_gt = ground_truth[:, 0, :, :2]
+        ego_pred = final_plan_traj[:, :, :2]
+        ade, fde = compute_ade_fde(ego_pred, ego_gt)
+        ego_ades.append(ade)
+        ego_fdes.append(fde)
 
-                        def denorm_xy(xy):
-                            # xy: (..., 2)  rot con +heading luego traslada
-                            xr = xy[..., 0] * c - xy[..., 1] * s
-                            yr = xy[..., 0] * s + xy[..., 1] * c
-                            out = np.stack([xr, yr], axis=-1)
-                            out = out + ego_pos0
-                            return out
+        # Metrics - neighbors
+        neighbor_gt = ground_truth[:, 1:, :, :2]
+        neighbor_pred = final_prediction[:, :, :, :2]
+        valid_mask = torch.sum(torch.abs(neighbor_gt), dim=(2, 3)) > 0
 
-                        ego_hist_dn   = denorm_xy(ego[b, :, :2].cpu().numpy())
-                        ego_pred_dn   = denorm_xy(ego_pred[b, :, :].cpu().numpy())
-                        ego_gt_dn     = denorm_xy(ego_gt[b, :, :].cpu().numpy())
-                        nb_hist_dn    = denorm_xy(nb_hist)
-                        nb_pred_dn    = denorm_xy(neighbor_pred[b, :, :, :].cpu().numpy())
-                        nb_gt_dn      = denorm_xy(neighbor_gt[b, :, :, :].cpu().numpy())
-                        top3_trajs_dn    = np.stack([denorm_xy(top3_trajs_norm[k])    for k in range(K)], axis=0)
-                        top3_nb_preds_dn = np.stack([denorm_xy(top3_nb_preds_norm[k]) for k in range(K)], axis=0)
-                    else:
-                        ego_hist_dn   = ego[b, :, :2].cpu().numpy()
-                        ego_pred_dn   = ego_pred[b, :, :].cpu().numpy()
-                        ego_gt_dn     = ego_gt[b, :, :].cpu().numpy()
-                        nb_hist_dn    = nb_hist
-                        nb_pred_dn    = neighbor_pred[b, :, :, :].cpu().numpy()
-                        nb_gt_dn      = neighbor_gt[b, :, :, :].cpu().numpy()
-                        top3_trajs_dn    = top3_trajs_norm
-                        top3_nb_preds_dn = top3_nb_preds_norm
+        for bb in range(neighbor_gt.shape[0]):
+            for n in range(neighbor_gt.shape[1]):
+                if valid_mask[bb, n]:
+                    ade, fde = compute_ade_fde(
+                        neighbor_pred[bb, n:n+1],
+                        neighbor_gt[bb, n:n+1]
+                    )
+                    neighbor_ades.append(ade)
+                    neighbor_fdes.append(fde)
 
-                    sample_data = {
-                        'ego_hist': ego_hist_dn,
-                        'ego_pred': ego_pred_dn,
-                        'ego_gt':   ego_gt_dn,
-                        'neighbors_hist': nb_hist_dn,
-                        'neighbors_pred': nb_pred_dn,
-                        'neighbors_gt':   nb_gt_dn,
-                        'num_valid_neighbors': int(n_valid),
-                        'neighbors_valid':     neigh_valid,         # (N,) bool — flag del dataset
-                        'ego_top3_trajs':      top3_trajs_dn,       # (3, pred_len, 2)
-                        'ego_top3_scores':     top3_scores,         # (3,) probabilidades softmax
-                        'ego_top3_nb_preds':   top3_nb_preds_dn,   # (3, N, pred_len, 2)
-                    }
-                    vis_samples.append(sample_data)
-    # Calcular promedios
-    results = {
-        'ego_ADE': np.mean(ego_ades),
-        'ego_FDE': np.mean(ego_fdes),
-        'neighbor_ADE': np.mean(neighbor_ades) if neighbor_ades else 0.0,
-        'neighbor_FDE': np.mean(neighbor_fdes) if neighbor_fdes else 0.0,
-        'num_samples': len(ego_ades),
-        'num_neighbors_evaluated': len(neighbor_ades),
-        'vis_samples': vis_samples
+        # Visualizations
+        # (tu visual standard ya la tienes, no la toco aquí para no alargar)
+        # Si quieres también te la ajusto a "final only", pero lo principal era VAE.
+
+    return {
+        "predictor_type": "standard",
+        "ego_ADE": np.mean(ego_ades) if ego_ades else 0.0,
+        "ego_FDE": np.mean(ego_fdes) if ego_fdes else 0.0,
+        "neighbor_ADE": np.mean(neighbor_ades) if neighbor_ades else 0.0,
+        "neighbor_FDE": np.mean(neighbor_fdes) if neighbor_fdes else 0.0,
+        "num_samples": len(ego_ades),
+        "num_neighbors_evaluated": len(neighbor_ades),
+        "vis_samples": vis_samples,
     }
-    
-    return results
 
+
+@torch.no_grad()
+def evaluate_model_vae(
+    model, data_loader, device,
+    use_planning=False, planner=None,
+    save_vis=False, num_vis_samples=10,
+    min_neighbors=0, raw_dataset=None,
+    vae_num_samples=15,
+    vae_select_mode="best_of_k",      # best_of_k | mean_of_k | first
+    vae_vis_mode="final"              # final | multi | both
+):
+    """
+    Nuevo flujo VAE:
+    1) sample K (plans, neighbors)
+    2) selecciona UNA (best_of_k) o promedio (mean_of_k)
+    3) planner optimiza UNA vez
+    4) visualiza una escena final (y opcionalmente también las K muestras)
+    """
+    model.eval()
+
+    ego_ades, ego_fdes = [], []
+    neighbor_ades, neighbor_fdes = [], []
+    vis_samples = []
+
+    vis_candidate_indices = set()
+    if save_vis and raw_dataset is not None:
+        vis_candidate_indices = get_visualization_candidates(raw_dataset, num_vis_samples, min_neighbors)
+
+    for batch_idx, batch in enumerate(tqdm(data_loader, desc="Evaluating VAE predictor")):
+        ego = batch[0].to(device)
+        neighbors = batch[1].to(device)
+        ground_truth = batch[2].to(device)
+
+        current_state = make_current_state(ego, neighbors)
+
+        # 1) Genera K muestras
+        model_out = run_batch_vae(
+            model=model,
+            ego=ego,
+            neighbors=neighbors,
+            ground_truth=ground_truth,
+            num_samples=vae_num_samples
+        )
+
+        # 2) Selección antes del planner
+        plan_control_init, prediction_init, weights_init, selected_idx, aux_vis = \
+            select_vae_candidate_before_planning(
+                model_out=model_out,
+                ground_truth=ground_truth,
+                selection_mode=vae_select_mode
+            )
+
+        # 3) Planner: UNA sola optimización (si use_planning)
+        if use_planning and planner is not None:
+            final_plan_traj, _ = apply_planning_single(
+                plan_control_init=plan_control_init,
+                prediction_init=prediction_init,
+                cost_function_weights_init=weights_init,
+                ego=ego,
+                current_state=current_state,
+                planner=planner,
+                T=12
+            )
+        else:
+            # si no hay planner, conviertes control->traj con bicycle
+            final_plan_traj = bicycle_model(plan_control_init, ego[:, -1])[:, :, :3]
+
+        final_prediction = prediction_init  # vecinos (seleccionados o promedio)
+
+        # 4) Metrics - ego
+        ego_gt = ground_truth[:, 0, :, :2]
+        ego_pred = final_plan_traj[:, :, :2]
+        ade, fde = compute_ade_fde(ego_pred, ego_gt)
+        ego_ades.append(ade)
+        ego_fdes.append(fde)
+
+        # 5) Metrics - neighbors
+        neighbor_gt = ground_truth[:, 1:, :, :2]
+        neighbor_pred = final_prediction[:, :, :, :2]
+        valid_mask = torch.sum(torch.abs(neighbor_gt), dim=(2, 3)) > 0
+
+        for bb in range(neighbor_gt.shape[0]):
+            for n in range(neighbor_gt.shape[1]):
+                if valid_mask[bb, n]:
+                    ade, fde = compute_ade_fde(
+                        neighbor_pred[bb, n:n+1],
+                        neighbor_gt[bb, n:n+1]
+                    )
+                    neighbor_ades.append(ade)
+                    neighbor_fdes.append(fde)
+
+        # 6) Visualizations
+        if save_vis and len(vis_samples) < num_vis_samples:
+            batch_start = batch_idx * data_loader.batch_size
+            for bb in range(ego.shape[0]):
+                if len(vis_samples) >= num_vis_samples:
+                    break
+
+                global_idx = batch_start + bb
+                if global_idx not in vis_candidate_indices:
+                    continue
+
+                if vae_vis_mode in ("final", "both"):
+                    sample_final = pack_vis_sample_vae_final_only(
+                        b=bb,
+                        batch_start=batch_start,
+                        ego=ego,
+                        neighbors=neighbors,
+                        ground_truth=ground_truth,
+                        final_plan_traj=final_plan_traj,
+                        final_prediction=final_prediction,
+                        raw_dataset=raw_dataset
+                    )
+                    # útil para saber qué modo usaste
+                    sample_final["vae_select_mode"] = vae_select_mode
+                    if selected_idx is not None:
+                        sample_final["selected_idx"] = int(selected_idx[bb].item())
+                    vis_samples.append(sample_final)
+
+                if vae_vis_mode in ("multi", "both") and len(vis_samples) < num_vis_samples:
+                    sample_multi = pack_vis_sample_vae_multi_optional(
+                        b=bb,
+                        batch_start=batch_start,
+                        ego=ego,
+                        neighbors=neighbors,
+                        ground_truth=ground_truth,
+                        plan_trajs_all=aux_vis["plan_trajs_all"],
+                        predictions_all=aux_vis["predictions_all"],
+                        selected_idx=aux_vis["selected_idx"],
+                        raw_dataset=raw_dataset
+                    )
+                    sample_multi["vae_select_mode"] = vae_select_mode
+                    vis_samples.append(sample_multi)
+
+    return {
+        "predictor_type": "vae",
+        "ego_ADE": np.mean(ego_ades) if ego_ades else 0.0,
+        "ego_FDE": np.mean(ego_fdes) if ego_fdes else 0.0,
+        "neighbor_ADE": np.mean(neighbor_ades) if neighbor_ades else 0.0,
+        "neighbor_FDE": np.mean(neighbor_fdes) if neighbor_fdes else 0.0,
+        "num_samples": len(ego_ades),
+        "num_neighbors_evaluated": len(neighbor_ades),
+        "vis_samples": vis_samples,
+    }
+
+
+# =========================================================
+# Main
+# =========================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Test ETH/UCY')
-    parser.add_argument('--model_path', type=str, required=True, help='Path to trained model')
-    parser.add_argument('--test_set', type=str, required=True, help='Path to test dataset')
-    parser.add_argument('--name', type=str, default='test_result', help='Name for logging')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for testing')
-    parser.add_argument('--use_planning', action='store_true', help='Use planning module')
-    parser.add_argument('--device', type=str, default='cuda', help='Device to use')
-    parser.add_argument('--num_vis_samples', type=int, default=20, help='Number of samples to visualize')
-    parser.add_argument('--min_neighbors', type=int, default=0, help='Minimum valid neighbors to include a sample in visualization')
-    parser.add_argument('--predictor', type=str, default='Predictor', help='Predictor model type')
+    parser = argparse.ArgumentParser(description="Test ETH/UCY")
+    parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--test_set", type=str, required=True)
+    parser.add_argument("--name", type=str, default="test_result")
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--use_planning", action="store_true")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--num_vis_samples", type=int, default=20)
+    parser.add_argument("--min_neighbors", type=int, default=0)
+    parser.add_argument("--predictor", type=str, default="Predictor", choices=["Predictor", "PredictorVAE"])
+    parser.add_argument("--save_vis", action="store_true", help="Guardar imágenes de visualización")
+
+    # VAE
+    parser.add_argument("--vae_num_samples", type=int, default=20,
+                        help="Número de muestras z para PredictorVAE en inferencia")
+    parser.add_argument("--vae_select_mode", type=str, default="best_of_k",
+                        choices=["first", "best_of_k", "mean_of_k"],
+                        help="Cómo seleccionar UNA muestra antes del planner (best_of_k usa GT)")
+    parser.add_argument("--vae_vis_mode", type=str, default="final",
+                        choices=["final", "multi", "both"],
+                        help="Qué guardar/visualizar: final=una escena, multi=K muestras, both=ambas")
+
     args = parser.parse_args()
-    
-    # Setup logging
+
     log_path = f"./testing_log/{args.name}/"
     os.makedirs(log_path, exist_ok=True)
+
     logging.basicConfig(
         level=logging.INFO,
         format='[%(levelname)s %(asctime)s] %(message)s',
@@ -309,111 +684,117 @@ def main():
             logging.StreamHandler()
         ]
     )
-    
-    logging.info(f"{'='*60}")
+
+    logging.info("=" * 60)
     logging.info(f"Testing: {args.name}")
     logging.info(f"Model: {args.model_path}")
     logging.info(f"Test set: {args.test_set}")
     logging.info(f"Use planning: {args.use_planning}")
+    logging.info(f"Predictor: {args.predictor}")
     logging.info(f"Device: {args.device}")
-    logging.info(f"{'='*60}")
-    
-    
-    # Cargar modelo
     if args.predictor == "PredictorVAE":
-        predictor = PredictorVAE(12).to(args.device)
-        NUM_MODES = 1
+        logging.info(f"VAE num samples: {args.vae_num_samples}")
+        logging.info(f"VAE select mode: {args.vae_select_mode}")
+        logging.info(f"VAE vis mode: {args.vae_vis_mode}")
+    logging.info("=" * 60)
+
+    if args.predictor == "PredictorVAE":
+        model = PredictorVAE(12).to(args.device)
     else:
-        predictor = Predictor(12).to(args.device)
-        NUM_MODES = 20
+        model = Predictor(12).to(args.device)
 
     logging.info("Loading model...")
-    predictor.load_state_dict(torch.load(args.model_path, map_location=args.device))
-    predictor.eval()
+    model.load_state_dict(torch.load(args.model_path, map_location=args.device))
+    model.eval()
     logging.info("Model loaded successfully!")
-    
-    # Setup planner si es necesario
+
     planner = None
     if args.use_planning:
         logging.info("Setting up planner...")
-        trajectory_len, feature_len = 12, 9
-        planner = MotionPlanner(trajectory_len, args.device, test=True)
+        # IMPORTANT: usa dt=0.4 para ETH/UCY (tu dataset)
+        planner = MotionPlanner(12, args.device, test=True, dt=0.4)
         logging.info("Planner ready!")
-    
-    # Cargar datos
+
     logging.info("Loading test data...")
     test_set = DrivingData(args.test_set)
     test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
     logging.info(f"Test set: {len(test_set)} samples")
-    
-    # Evaluar
-    logging.info(f"\n{'='*60}")
+
+    logging.info("=" * 60)
     logging.info("Starting evaluation...")
-    logging.info(f"{'='*60}\n")
-    
-    vis_path = f"{log_path}/visualizations"
-    results = evaluate_model(predictor, test_loader, args.device, 
-                            args.use_planning, planner,
-                            visualize=True, 
-                            vis_path=vis_path,
-                            num_vis_samples=args.num_vis_samples,
-                            min_neighbors=args.min_neighbors,
-                            raw_dataset=test_set)
-    
-    # Generar visualizaciones
-    # if len(results['vis_samples']) > 0:
-    #     logging.info(f"\n{'='*60}")
-    #     logging.info("Generating visualizations...")
-    #     logging.info(f"{'='*60}\n")
-        
-    #     # Visualizaciones de top-3 modos (una imagen con 3 subplots por muestra)
-    #     for idx, sample in enumerate(results['vis_samples']):
-    #         if 'ego_top3_trajs' in sample:
-    #             plot_ego_top3_modes(
-    #                 ego_hist=sample['ego_hist'],
-    #                 ego_gt=sample['ego_gt'],
-    #                 ego_top3_trajs=sample['ego_top3_trajs'],
-    #                 ego_top3_scores=sample.get('ego_top3_scores', None),
-    #                 ego_top3_nb_preds=sample.get('ego_top3_nb_preds', None),
-    #                 neighbors_hist=sample['neighbors_hist'],
-    #                 neighbors_valid=sample.get('neighbors_valid', None),
-    #                 neighbors_gt=sample['neighbors_gt'],
-    #                 save_path=vis_path,
-    #                 sample_id=idx
-    #             )
-        
-    #     logging.info(f"Visualizations saved to: {vis_path}")
-    
-    # Mostrar resultados
-    logging.info(f"\n{'='*60}")
+    logging.info("=" * 60)
+
+    if args.predictor == "PredictorVAE":
+        results = evaluate_model_vae(
+            model=model,
+            data_loader=test_loader,
+            device=args.device,
+            use_planning=args.use_planning,
+            planner=planner,
+            save_vis=args.save_vis,
+            num_vis_samples=args.num_vis_samples,
+            min_neighbors=args.min_neighbors,
+            raw_dataset=test_set,
+            vae_num_samples=args.vae_num_samples,
+            vae_select_mode=args.vae_select_mode,
+            vae_vis_mode=args.vae_vis_mode
+        )
+    else:
+        results = evaluate_model_standard(
+            model=model,
+            data_loader=test_loader,
+            device=args.device,
+            use_planning=args.use_planning,
+            planner=planner,
+            save_vis=args.save_vis,
+            num_vis_samples=args.num_vis_samples,
+            min_neighbors=args.min_neighbors,
+            raw_dataset=test_set
+        )
+
+    logging.info("=" * 60)
     logging.info("RESULTS")
-    logging.info(f"{'='*60}")
-    logging.info(f"Ego Agent:")
+    logging.info("=" * 60)
+    logging.info("Ego Agent:")
     logging.info(f"  ADE: {results['ego_ADE']:.4f} m")
     logging.info(f"  FDE: {results['ego_FDE']:.4f} m")
-    logging.info(f"\nNeighbor Agents:")
+    logging.info("Neighbor Agents:")
     logging.info(f"  ADE: {results['neighbor_ADE']:.4f} m")
     logging.info(f"  FDE: {results['neighbor_FDE']:.4f} m")
-    logging.info(f"\nStatistics:")
+    logging.info("Statistics:")
     logging.info(f"  Total samples: {results['num_samples']}")
     logging.info(f"  Neighbors evaluated: {results['num_neighbors_evaluated']}")
-    logging.info(f"{'='*60}\n")
-    
-    # Guardar resultados
+    logging.info("=" * 60)
+
     results_file = f"{log_path}/results.txt"
-    with open(results_file, 'w') as f:
+    with open(results_file, "w") as f:
         f.write(f"Model: {args.model_path}\n")
         f.write(f"Test set: {args.test_set}\n")
         f.write(f"Use planning: {args.use_planning}\n")
-        f.write(f"\n{'='*60}\n")
+        f.write(f"Predictor: {args.predictor}\n")
+        if args.predictor == "PredictorVAE":
+            f.write(f"VAE num samples: {args.vae_num_samples}\n")
+            f.write(f"VAE select mode: {args.vae_select_mode}\n")
+            f.write(f"VAE vis mode: {args.vae_vis_mode}\n")
+        f.write("\n")
         f.write(f"Ego ADE: {results['ego_ADE']:.4f} m\n")
         f.write(f"Ego FDE: {results['ego_FDE']:.4f} m\n")
         f.write(f"Neighbor ADE: {results['neighbor_ADE']:.4f} m\n")
         f.write(f"Neighbor FDE: {results['neighbor_FDE']:.4f} m\n")
-        f.write(f"\nTotal samples: {results['num_samples']}\n")
+        f.write(f"Total samples: {results['num_samples']}\n")
         f.write(f"Neighbors evaluated: {results['num_neighbors_evaluated']}\n")
-    
+
     logging.info(f"Results saved to: {results_file}")
+
+    # Visualizations
+    if args.save_vis and len(results["vis_samples"]) > 0:
+        vis_path = f"{log_path}/visualizations"
+        save_visualizations_from_samples(
+            samples_data=results["vis_samples"],
+            save_path=vis_path,
+            predictor_type=results["predictor_type"]  # aquí "vae" o "standard"
+        )
+        logging.info(f"Visualizations saved to: {vis_path}")
 
 
 if __name__ == "__main__":

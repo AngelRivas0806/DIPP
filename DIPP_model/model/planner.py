@@ -60,7 +60,8 @@ def collision_avoidance_residual(optim_vars, aux_vars):
     safety_distance = aux_vars[3].tensor[0]  # scalar tensor (no .item())
 
     ego_current_state = current_state[:, 0]  # (B, 8)
-    ego_traj = bicycle_model(control, ego_current_state)  # (B, T, 4) -> [x,y,theta,v]
+    dt = aux_vars[2].tensor[0]  # dt_var (scalar tensor)
+    ego_traj = bicycle_model(control, ego_current_state, dt=dt)
     ego_pos = ego_traj[:, :, :2]             # (B, T, 2)
 
     neighbors_pos = predictions[:, :, :, :2] # (B, K, T, 2)
@@ -97,6 +98,7 @@ def trajectory_following_residual(optim_vars, aux_vars):
 
     gt_trajectory = aux_vars[0].tensor       # (B, T, 3)
     current_state = aux_vars[1].tensor       # (B, 1+K, 8)
+    dt = aux_vars[2].tensor[0]
 
     ego_current_state = current_state[:, 0]  # (B, 8)
     ego_traj = bicycle_model(control, ego_current_state)  # (B, T, 4)
@@ -217,7 +219,7 @@ class MotionPlanner:
         if test:
             self.optimizer = th.GaussNewton(
                 objective, th.CholeskyDenseSolver,
-                vectorize=False, max_iterations=50, step_size=0.3, abs_err_tolerance=1e-2
+                vectorize=False, max_iterations=10, step_size=0.3, abs_err_tolerance=1e-2
             )
         else:
             self.optimizer = th.GaussNewton(

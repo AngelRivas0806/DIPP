@@ -80,10 +80,8 @@ class DrivingData(Dataset):
 
         # Heading por velocidad en el último frame observado
         vx_end, vy_end = float(ego[-1, 2]), float(ego[-1, 3])
-        if abs(vx_end) < 1e-2 and abs(vy_end) < 1e-2:
-            heading = 0.0
-        else:
-            heading = float(np.arctan2(vy_end, vx_end))
+        speed = float(np.hypot(vx_end, vy_end))
+        heading = 0.0 if speed < 1e-4 else float(np.arctan2(vy_end, vx_end))
 
         c = float(np.cos(-heading))
         s = float(np.sin(-heading))
@@ -245,16 +243,27 @@ def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Opti
         ego_l = F.smooth_l1_loss(prediction_all[:, 0, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
     else:
         ego_l = torch.tensor(0.0, device=plans.device)
-    pred_loss = ego_l
+    # pred_loss = ego_l
 
-    # Vecinos: suma sobre xy, T y vecinos presentes (sin dividir)
-    gt_nei_xy   = ground_truth[:, 1:, :, :2]
-    pred_nei_xy = prediction_all[:, 1:, :, :2]
-    nei_l = F.smooth_l1_loss(pred_nei_xy, gt_nei_xy, reduction='none').sum(dim=-1, keepdim=True)  # (B,N,T,1)
-    nei_l = (nei_l * neigh_mask.float()).sum()  # escalar: suma total
-    pred_loss = pred_loss + nei_l
+    # Vecinos
+    gt_nei_xy = ground_truth[:, 1:, :, :2]                          # (B, N, T, 2)
+    pred_nei_xy = prediction_all[:, 1:, :, :2]                     # (B, N, T, 2)
 
+    nei_l = F.smooth_l1_loss(
+        pred_nei_xy,
+        gt_nei_xy,
+        reduction="none",
+    ).sum(dim=-1, keepdim=True)                                    # (B, N, T, 1)
+
+    nei_l = (nei_l * neigh_mask.float()).sum()                     # escalar
+
+    pred_loss = ego_l + nei_l
+
+    # =========================================================
+    # 5) Total
+    # =========================================================
     total = 0.5 * pred_loss + score_loss
+
     return total, pred_loss, score_loss, best_mode
 
 
@@ -302,7 +311,7 @@ def VAE_loss(plans, predictions, ground_truth, weights, mu, logvar, ego_in_pred_
 
     # Solo contar timesteps válidos según neigh_mask
     nei_l = (nei_l * neigh_mask.float()).sum()
-
+ 
     pred_loss = pred_loss + nei_l
 
     # Pérdida KL del VAE
@@ -397,46 +406,160 @@ def motion_metrics(plan_trajectory, prediction_trajectories, ground_truth_trajec
 # =========================================================
 # Motion models
 # =========================================================
-def bicycle_model(control, current_state):
-    """
-    Modelo cinemático de vehículo (bicycle model).
-    current_state: (B, 6) = [x, y, vx, vy, ax, ay]  ← formato ego del dataset
-                   (B, 4) = [x, y, theta, v]          ← formato compacto (fallback)
-    control:       (B, T, 2) = [accel, steering]
-    """
-    dt = 0.4  # 0.4s por frame
-    max_delta = 0.6
-    max_a = 5.0
-    L = 3.089  # wheelbase (robot/vehículo)
+# def bicycle_model(control, current_state):
+#     """
+#     Modelo cinemático de vehículo (bicycle model).
+#     current_state: (B, 6) = [x, y, vx, vy, ax, ay]  ← formato ego del dataset
+#                    (B, 4) = [x, y, theta, v]          ← formato compacto (fallback)
+#     control:       (B, T, 2) = [accel, steering]
+#     """
+#     dt = 0.4  # 0.4s por frame
+#     max_delta = 0.6
+#     max_a = 5.0
+#     L = 3.089  # wheelbase (robot/vehículo)
 
-    x_0     = current_state[:, 0]
-    y_0     = current_state[:, 1]
+#     x_0     = current_state[:, 0]
+#     y_0     = current_state[:, 1] 
+
+#     if current_state.shape[1] >= 6:
+#         # Formato ego del dataset: [x, y, vx, vy, ax, ay]
+#         # En el frame ego-centrado: vx > 0, vy ≈ 0, theta ≈ 0
+#         vx_0    = current_state[:, 2]
+#         vy_0    = current_state[:, 3]
+#         theta_0 = torch.atan2(vy_0, vx_0)                          # (B,) heading inicial
+#         v_0     = torch.hypot(vx_0, vy_0)                          # (B,) velocidad inicial
+#     else:
+#         # Formato compacto: [x, y, theta, v]
+#         theta_0 = current_state[:, 2]
+#         v_0     = current_state[:, 3]
+
+#     a     = control[:, :, 0].clamp(-max_a, max_a)                  # (B, T)
+#     delta = control[:, :, 1].clamp(-max_delta, max_delta)          # (B, T)
+
+#     v = torch.clamp(v_0.unsqueeze(1) + torch.cumsum(a * dt, dim=1), min=0.0)  # (B, T)
+
+#     d_theta = v * delta / L                                         # (B, T)
+#     theta   = torch.fmod(theta_0.unsqueeze(1) + torch.cumsum(d_theta * dt, dim=1), 2 * torch.pi)  # (B, T)
+
+#     x = x_0.unsqueeze(1) + torch.cumsum(v * torch.cos(theta) * dt, dim=1)  # (B, T)
+#     y = y_0.unsqueeze(1) + torch.cumsum(v * torch.sin(theta) * dt, dim=1)  # (B, T)
+
+#     return torch.stack([x, y, theta, v], dim=-1)  # (B, T, 4)
+
+# def bicycle_model(control, current_state):
+#     """
+#     Modelo cinemático bicycle.
+
+#     current_state:
+#         (B, 6) = [x, y, vx, vy, ax, ay]
+#         o
+#         (B, 4) = [x, y, theta, v]
+
+#     control:
+#         (B, T, 2) = [accel, steering]
+#     """
+#     dt = 0.4
+#     max_delta = 0.6
+#     max_a = 5.0
+#     L = 3.089
+
+#     x_0 = current_state[:, 0]
+#     y_0 = current_state[:, 1]
+
+#     if current_state.shape[1] >= 6:
+#         vx_0 = current_state[:, 2]
+#         vy_0 = current_state[:, 3]
+#         theta_0 = torch.atan2(vy_0, vx_0)
+#         v_0 = torch.hypot(vx_0, vy_0)
+#     else:
+#         theta_0 = current_state[:, 2]
+#         v_0 = current_state[:, 3]
+
+#     a = control[:, :, 0].clamp(-max_a, max_a)
+#     delta = control[:, :, 1].clamp(-max_delta, max_delta)
+
+#     B, T, _ = control.shape
+
+#     x_list = []
+#     y_list = []
+#     theta_list = []
+#     v_list = []
+
+#     x_t = x_0
+#     y_t = y_0
+#     theta_t = theta_0
+#     v_t = v_0
+
+#     for t in range(T):
+#         a_t = a[:, t]
+#         delta_t = delta[:, t]
+
+#         v_t = torch.clamp(v_t + a_t * dt, min=0.0)
+#         theta_t = theta_t + (v_t / L) * torch.tan(delta_t) * dt
+
+#         x_t = x_t + v_t * torch.cos(theta_t) * dt
+#         y_t = y_t + v_t * torch.sin(theta_t) * dt
+
+#         x_list.append(x_t)
+#         y_list.append(y_t)
+#         theta_list.append(theta_t)
+#         v_list.append(v_t)
+
+#     x = torch.stack(x_list, dim=1)
+#     y = torch.stack(y_list, dim=1)
+#     theta = torch.stack(theta_list, dim=1)
+#     v = torch.stack(v_list, dim=1)
+
+#     return torch.stack([x, y, theta, v], dim=-1)  # (B, T, 4)
+
+
+import torch
+from typing import Union
+
+def bicycle_model(control: torch.Tensor,
+                  current_state: torch.Tensor,
+                  dt: Union[torch.Tensor, float] = 0.4,
+                  L: float = 3.089,
+                  max_delta: float = 0.6,
+                  max_a: float = 5.0):
+    """
+    Kinematic bicycle model (differentiable).
+
+    control: (B, T, 2) = [accel, steering_angle]
+    current_state:
+        (B, 6) = [x, y, vx, vy, ax, ay]
+        or
+        (B, 4) = [x, y, theta, v]
+    dt: float or scalar tensor (Theseus aux var)
+    returns: (B, T, 4) = [x, y, theta, v]
+    """
+    if not torch.is_tensor(dt):
+        dt = torch.tensor(dt, device=control.device, dtype=control.dtype)
+    else:
+        dt = dt.to(device=control.device, dtype=control.dtype)
+
+    x0 = current_state[:, 0]
+    y0 = current_state[:, 1]
 
     if current_state.shape[1] >= 6:
-        # Formato ego del dataset: [x, y, vx, vy, ax, ay]
-        # En el frame ego-centrado: vx > 0, vy ≈ 0, theta ≈ 0
-        vx_0    = current_state[:, 2]
-        vy_0    = current_state[:, 3]
-        theta_0 = torch.atan2(vy_0, vx_0)                          # (B,) heading inicial
-        v_0     = torch.hypot(vx_0, vy_0)                          # (B,) velocidad inicial
+        vx0 = current_state[:, 2]
+        vy0 = current_state[:, 3]
+        theta0 = torch.atan2(vy0, vx0)
+        v0 = torch.hypot(vx0, vy0)
     else:
-        # Formato compacto: [x, y, theta, v]
-        theta_0 = current_state[:, 2]
-        v_0     = current_state[:, 3]
+        theta0 = current_state[:, 2]
+        v0 = current_state[:, 3]
 
-    a     = control[:, :, 0].clamp(-max_a, max_a)                  # (B, T)
-    delta = control[:, :, 1].clamp(-max_delta, max_delta)          # (B, T)
+    a = control[:, :, 0].clamp(-max_a, max_a)
+    delta = control[:, :, 1].clamp(-max_delta, max_delta)
 
-    v = torch.clamp(v_0.unsqueeze(1) + torch.cumsum(a * dt, dim=1), min=0.0)  # (B, T)
+    v = torch.clamp(v0.unsqueeze(1) + torch.cumsum(a * dt, dim=1), min=0.0)
+    theta = theta0.unsqueeze(1) + torch.cumsum((v / L) * torch.tan(delta) * dt, dim=1)
 
-    d_theta = v * delta / L                                         # (B, T)
-    theta   = torch.fmod(theta_0.unsqueeze(1) + torch.cumsum(d_theta * dt, dim=1), 2 * torch.pi)  # (B, T)
+    x = x0.unsqueeze(1) + torch.cumsum(v * torch.cos(theta) * dt, dim=1)
+    y = y0.unsqueeze(1) + torch.cumsum(v * torch.sin(theta) * dt, dim=1)
 
-    x = x_0.unsqueeze(1) + torch.cumsum(v * torch.cos(theta) * dt, dim=1)  # (B, T)
-    y = y_0.unsqueeze(1) + torch.cumsum(v * torch.sin(theta) * dt, dim=1)  # (B, T)
-
-    return torch.stack([x, y, theta, v], dim=-1)  # (B, T, 4)
-
+    return torch.stack([x, y, theta, v], dim=-1)
 
 # def physical_model(control, current_state, dt=0.1):
 #     """

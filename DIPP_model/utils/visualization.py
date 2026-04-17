@@ -3,324 +3,138 @@ import numpy as np
 import os
 
 
-def plot_trajectory_prediction(ego_hist, ego_pred, ego_gt, 
-                               neighbors_hist=None, neighbors_pred=None, neighbors_gt=None,
-                               save_path=None, show=False, sample_id=0):
+def _ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+
+# =========================================================
+# Standard: Top-K
+# =========================================================
+def plot_ego_topk_modes(
+    ego_hist,
+    ego_gt,
+    ego_topk_trajs,
+    ego_topk_scores=None,
+    ego_topk_nb_preds=None,
+    neighbors_hist=None,
+    neighbors_valid=None,
+    neighbors_gt=None,
+    save_path=None,
+    sample_id=0,
+    predictor_type="standard"
+):
     """
-    Visualizar predicciones de trayectorias
-    
+    Predictor normal:
+    - Predicciones: líneas limpias (sin markers)
+    - GT: con tachitas 'x' en cada paso
+    - Conector hist->pred muy tenue
     """
-    fig, ax = plt.subplots(figsize=(12, 10))
-    
-    # Colores
-    ego_color = '#FF0000'  # Rojo para ego
-    neighbor_color = '#0000FF'  # Azul para vecinos
-    ego_pred_color = '#FF8C00'  # Naranja para predicción del ego
-    neighbor_pred_color = '#00FF00'  # Verde para predicciones de vecinos
-    hist_alpha = 0.6
-    pred_alpha = 0.8
-    
-    # ========== EGO ==========
-    # Historia del ego
-    ax.plot(ego_hist[:, 0], ego_hist[:, 1], 
-            color=ego_color, linewidth=3, linestyle='-', alpha=hist_alpha,
-            label='Ego History', marker='o', markersize=6)
-    
-    # Predicción del ego
-    ax.plot(ego_pred[:, 0], ego_pred[:, 1], 
-            color=ego_pred_color, linewidth=3, linestyle='--', alpha=pred_alpha,
-            label='Ego Prediction', marker='s', markersize=6)
-    
-    # Ground truth del ego
-    ax.plot(ego_gt[:, 0], ego_gt[:, 1], 
-            color=ego_color, linewidth=2, linestyle=':', alpha=0.9,
-            label='Ego Ground Truth', marker='x', markersize=8)
-    
-    # Conectar historia con predicción
-    ax.plot([ego_hist[-1, 0], ego_pred[0, 0]], 
-            [ego_hist[-1, 1], ego_pred[0, 1]], 
-            color=ego_pred_color, linewidth=1, linestyle='--', alpha=0.5)
-    
-    # Marcar puntos importantes del ego
-    # Punto de inicio de la historia (azul oscuro)
-    ax.scatter(ego_hist[0, 0], ego_hist[0, 1], 
-              color='darkblue', s=150, marker='o', edgecolors='black', 
-              linewidths=2, zorder=10, label='Ego History Start')
-    
-    # Punto donde empieza la predicción/ground truth (rojo - último de historia)
-    ax.scatter(ego_hist[-1, 0], ego_hist[-1, 1], 
-              color=ego_color, s=200, marker='o', edgecolors='black', 
-              linewidths=2, zorder=10, label='Ego Prediction Start')
-    
-    # Punto final predicho
-    ax.scatter(ego_pred[-1, 0], ego_pred[-1, 1], 
-              color=ego_pred_color, s=200, marker='*', edgecolors='black', 
-              linewidths=2, zorder=10, label='Ego Predicted End')
-    
-    # ========== VECINOS ==========
-    if neighbors_hist is not None and neighbors_pred is not None and neighbors_gt is not None:
-        num_neighbors = neighbors_hist.shape[0]
-        
-        for i in range(num_neighbors):
-            # Verificar si el vecino es válido (tiene historia)
-            if np.sum(np.abs(neighbors_hist[i])) == 0:
-                continue
-            
-            # Historia del vecino
-            ax.plot(neighbors_hist[i, :, 0], neighbors_hist[i, :, 1], 
-                   color=neighbor_color, linewidth=1.5, linestyle='-', alpha=hist_alpha,
-                   marker='o', markersize=3)
-            
-            # Predicción del vecino
-            ax.plot(neighbors_pred[i, :, 0], neighbors_pred[i, :, 1], 
-                   color=neighbor_pred_color, linewidth=1.5, linestyle='--', alpha=pred_alpha,
-                   marker='s', markersize=3)
-            
-            # Ground truth del vecino
-            ax.plot(neighbors_gt[i, :, 0], neighbors_gt[i, :, 1], 
-                   color=neighbor_color, linewidth=1, linestyle=':', alpha=0.7,
-                   marker='x', markersize=4)
-            
-            # Conectar historia con predicción
-            ax.plot([neighbors_hist[i, -1, 0], neighbors_pred[i, 0, 0]], 
-                   [neighbors_hist[i, -1, 1], neighbors_pred[i, 0, 1]], 
-                   color=neighbor_pred_color, linewidth=0.5, linestyle='--', alpha=0.3)
-        
-        # Agregar etiquetas solo una vez para los vecinos
-        ax.plot([], [], color=neighbor_color, linewidth=1.5, linestyle='-', 
-               alpha=hist_alpha, label='Neighbors History')
-        ax.plot([], [], color=neighbor_pred_color, linewidth=1.5, linestyle='--', 
-               alpha=pred_alpha, label='Neighbors Prediction')
-        ax.plot([], [], color=neighbor_color, linewidth=1, linestyle=':', 
-               alpha=0.7, label='Neighbors Ground Truth')
-    
-    # Configuración de la gráfica
-    ax.set_xlabel('X (m)', fontsize=14, fontweight='bold')
-    ax.set_ylabel('Y (m)', fontsize=14, fontweight='bold')
-    ax.set_title(f'Trajectory Prediction - Sample {sample_id}', 
-                fontsize=16, fontweight='bold', pad=20)
-    ax.legend(loc='best', fontsize=11, framealpha=0.9)
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-    ax.set_aspect('equal', adjustable='box')
-    
-    # Ajustar límites con margen
-    all_x = np.concatenate([ego_hist[:, 0], ego_pred[:, 0], ego_gt[:, 0]])
-    all_y = np.concatenate([ego_hist[:, 1], ego_pred[:, 1], ego_gt[:, 1]])
-    
+    K = ego_topk_trajs.shape[0]
+
+    ego_color = '#FF0000'
+    ego_gt_color = '#8B0000'
+    neighbor_color = '#0000FF'
+    neighbor_pred_color = '#00AA00'
+    neighbor_gt_color = '#000080'
+    mode_colors = ['#FF8C00', '#FFA500', '#FFD700', '#ADFF2F', '#FF69B4']
+    mode_labels = [f'Modo {k+1}' for k in range(K)]
+
+    all_x = np.concatenate([ego_hist[:, 0], ego_gt[:, 0], ego_topk_trajs[:, :, 0].ravel()])
+    all_y = np.concatenate([ego_hist[:, 1], ego_gt[:, 1], ego_topk_trajs[:, :, 1].ravel()])
+
     if neighbors_hist is not None:
         for i in range(neighbors_hist.shape[0]):
-            if np.sum(np.abs(neighbors_hist[i])) > 0:
-                all_x = np.concatenate([all_x, neighbors_hist[i, :, 0], 
-                                       neighbors_pred[i, :, 0], neighbors_gt[i, :, 0]])
-                all_y = np.concatenate([all_y, neighbors_hist[i, :, 1], 
-                                       neighbors_pred[i, :, 1], neighbors_gt[i, :, 1]])
-    
-    margin = 0.1
-    x_range = all_x.max() - all_x.min()
-    y_range = all_y.max() - all_y.min()
-    ax.set_xlim(all_x.min() - margin * x_range, all_x.max() + margin * x_range)
-    ax.set_ylim(all_y.min() - margin * y_range, all_y.max() + margin * y_range)
-    
-    plt.tight_layout()
-    
-    # Guardar
-    if save_path is not None:
-        os.makedirs(save_path, exist_ok=True)
-        filepath = os.path.join(save_path, f'prediction_sample_{sample_id:04d}.png')
-        plt.savefig(filepath, dpi=150, bbox_inches='tight')
-        print(f"Saved: {filepath}")
-    
-    # Mostrar
-    if show:
-        plt.show()
-    else:
-        plt.close()
+            valid_i = True
+            if neighbors_valid is not None:
+                valid_i = bool(neighbors_valid[i])
+            elif np.sum(np.abs(neighbors_hist[i])) == 0:
+                valid_i = False
 
-
-def plot_multiple_samples(samples_data, save_path, max_samples=6):
-    """
-    Crear una cuadrícula con múltiples muestras
-    
-    Args:
-        samples_data: Lista de diccionarios con las trayectorias
-        save_path: Directorio donde guardar
-        max_samples: Número máximo de muestras a plotear
-    """
-    num_samples = min(len(samples_data), max_samples)
-    rows = 2
-    cols = 3
-    
-    fig, axes = plt.subplots(rows, cols, figsize=(18, 12))
-    axes = axes.flatten()
-    
-    for idx, (ax, data) in enumerate(zip(axes[:num_samples], samples_data[:num_samples])):
-        # Colores
-        ego_color = '#FF0000'
-        neighbor_color = '#0000FF'
-        ego_pred_color = '#FF8C00'  # Naranja
-        neighbor_pred_color = '#00FF00'
-        
-        # Ego
-        ax.plot(data['ego_hist'][:, 0], data['ego_hist'][:, 1], 
-               color=ego_color, linewidth=2, alpha=0.6, marker='o', markersize=4)
-        ax.plot(data['ego_pred'][:, 0], data['ego_pred'][:, 1], 
-               color=ego_pred_color, linewidth=2, linestyle='--', alpha=0.8, marker='s', markersize=4)
-        ax.plot(data['ego_gt'][:, 0], data['ego_gt'][:, 1], 
-               color=ego_color, linewidth=1.5, linestyle=':', alpha=0.9, marker='x', markersize=5)
-        
-        # Vecinos
-        if 'neighbors_hist' in data:
-            for i in range(data['neighbors_hist'].shape[0]):
-                if np.sum(np.abs(data['neighbors_gt'][i])) > 0:
-                    ax.plot(data['neighbors_hist'][i, :, 0], data['neighbors_hist'][i, :, 1], 
-                           color=neighbor_color, linewidth=1, alpha=0.5)
-                    ax.plot(data['neighbors_pred'][i, :, 0], data['neighbors_pred'][i, :, 1], 
-                           color=neighbor_pred_color, linewidth=1, linestyle='--', alpha=0.6)
-        
-        ax.set_title(f'Sample {idx}', fontsize=12, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        ax.set_aspect('equal', adjustable='box')
-        ax.set_xlabel('X (m)', fontsize=10)
-        ax.set_ylabel('Y (m)', fontsize=10)
-    
-    # Ocultar ejes vacíos
-    for idx in range(num_samples, len(axes)):
-        axes[idx].axis('off')
-    
-    plt.suptitle('Trajectory Predictions - Multiple Samples', 
-                fontsize=16, fontweight='bold', y=0.995)
-    plt.tight_layout()
-    
-    os.makedirs(save_path, exist_ok=True)
-    filepath = os.path.join(save_path, 'predictions_grid.png')
-    plt.savefig(filepath, dpi=150, bbox_inches='tight')
-    print(f"Saved grid: {filepath}")
-    plt.close()
-
-
-def plot_ego_top3_modes(ego_hist, ego_gt, ego_top3_trajs,
-                        ego_top3_scores=None,
-                        ego_top3_nb_preds=None,
-                        neighbors_hist=None, neighbors_valid=None, neighbors_gt=None,
-                        save_path=None, sample_id=0):
-    """
-    Una imagen con 3 subplots (1 fila × 3 columnas), uno por cada modo del ego.
-    Cada subplot usa las predicciones de vecinos del modo correspondiente.
-    """
-    ego_color              = '#FF0000'   # rojo          - historia ego
-    ego_gt_color           = '#8B0000'   # rojo oscuro   - GT ego
-    neighbor_color         = '#0000FF'   # azul          - historia vecinos
-    neighbor_pred_color    = '#00AA00'   # verde         - predicción vecinos
-    neighbor_gt_color      = '#000080'   # azul oscuro   - GT vecinos
-    mode_colors            = ['#FF8C00', '#FFA500', '#FFD700']
-    mode_labels            = ['Modo 1 (más probable)', 'Modo 2', 'Modo 3']
-
-    # Calcular límites globales cuadrados e iguales para los 3 subplots
-    all_x = np.concatenate([ego_hist[:, 0], ego_gt[:, 0],
-                             ego_top3_trajs[:, :, 0].ravel()])
-    all_y = np.concatenate([ego_hist[:, 1], ego_gt[:, 1],
-                             ego_top3_trajs[:, :, 1].ravel()])
-    if neighbors_hist is not None:
-        for i in range(neighbors_hist.shape[0]):
-            if np.sum(np.abs(neighbors_hist[i])) > 0:
+            if valid_i:
                 all_x = np.concatenate([all_x, neighbors_hist[i, :, 0]])
                 all_y = np.concatenate([all_y, neighbors_hist[i, :, 1]])
+                if neighbors_gt is not None and np.sum(np.abs(neighbors_gt[i])) > 0:
+                    all_x = np.concatenate([all_x, neighbors_gt[i, :, 0]])
+                    all_y = np.concatenate([all_y, neighbors_gt[i, :, 1]])
+
     margin = 0.12
     cx = (all_x.max() + all_x.min()) / 2.0
     cy = (all_y.max() + all_y.min()) / 2.0
     half = max((all_x.max() - all_x.min()), (all_y.max() - all_y.min())) / 2.0 * (1 + margin)
-    half = half or 1.0
+    half = half if half > 0 else 1.0
     xlim = (cx - half, cx + half)
     ylim = (cy - half, cy + half)
 
-    # Tamaño de figura: 3 subplots cuadrados con el mismo lado
-    subplot_size = 8  # pulgadas por subplot
-    fig, axes = plt.subplots(1, 3, figsize=(subplot_size * 3, subplot_size))
-    fig.suptitle(f'Top-3 Ego Modes — Sample {sample_id}',
-                 fontsize=16, fontweight='bold', y=1.01)
+    fig, axes = plt.subplots(1, K, figsize=(8 * K, 8))
+    if K == 1:
+        axes = [axes]
+
+    fig.suptitle(
+        f'Top-{K} modos del ego con probabilidad — Sample {sample_id} ({predictor_type})',
+        fontsize=16, fontweight='bold', y=1.01
+    )
 
     for k, ax in enumerate(axes):
-        # Predicciones de vecinos para este modo concreto
-        nb_pred_k = ego_top3_nb_preds[k] if ego_top3_nb_preds is not None else None  # (N,12,2) o None
+        nb_pred_k = ego_topk_nb_preds[k] if ego_topk_nb_preds is not None else None
 
-        # ---- Vecinos (fondo) ----
+        # Vecinos: hist / pred / gt
         if neighbors_hist is not None:
             for i in range(neighbors_hist.shape[0]):
-                # Filtrar con flag del dataset si está disponible, si no, por suma de historia
+                valid_i = True
                 if neighbors_valid is not None:
-                    if not neighbors_valid[i]:
-                        continue
+                    valid_i = bool(neighbors_valid[i])
                 elif np.sum(np.abs(neighbors_hist[i])) == 0:
+                    valid_i = False
+                if not valid_i:
                     continue
-                # Historia
+
                 ax.plot(neighbors_hist[i, :, 0], neighbors_hist[i, :, 1],
-                        color=neighbor_color, linewidth=1.2, linestyle='-',
-                        alpha=0.45, marker='o', markersize=2)
-                # Predicción del vecino para el modo k
-                if nb_pred_k is not None:
+                        color=neighbor_color, linewidth=1.2, linestyle='-', alpha=0.45)
+
+                if nb_pred_k is not None and i < nb_pred_k.shape[0]:
                     ax.plot(nb_pred_k[i, :, 0], nb_pred_k[i, :, 1],
-                            color=neighbor_pred_color, linewidth=1.2, linestyle='--',
-                            alpha=0.55, marker='s', markersize=2)
-                    ax.plot([neighbors_hist[i, -1, 0], nb_pred_k[i, 0, 0]],
-                            [neighbors_hist[i, -1, 1], nb_pred_k[i, 0, 1]],
-                            color=neighbor_pred_color, linewidth=0.5, linestyle='--', alpha=0.3)
-                # GT
-                if neighbors_gt is not None:
+                            color=neighbor_pred_color, linewidth=1.2, linestyle='--', alpha=0.55)
+
+                if neighbors_gt is not None and i < neighbors_gt.shape[0] and np.sum(np.abs(neighbors_gt[i])) > 0:
                     ax.plot(neighbors_gt[i, :, 0], neighbors_gt[i, :, 1],
                             color=neighbor_gt_color, linewidth=1.0, linestyle=':',
-                            alpha=0.55, marker='x', markersize=3)
+                            alpha=0.85, marker='x', markersize=4, markevery=1)
 
-            # Etiquetas representativas (una sola vez por subplot)
-            ax.plot([], [], color=neighbor_color, linewidth=1.2, alpha=0.45,
-                    label='Neighbors Hist')
+            ax.plot([], [], color=neighbor_color, linewidth=1.2, alpha=0.45, label='Vecinos Hist')
             if nb_pred_k is not None:
-                ax.plot([], [], color=neighbor_pred_color, linewidth=1.2,
-                        linestyle='--', alpha=0.55, label='Neighbors Pred')
+                ax.plot([], [], color=neighbor_pred_color, linewidth=1.2, linestyle='--', alpha=0.55, label='Vecinos Pred')
             if neighbors_gt is not None:
-                ax.plot([], [], color=neighbor_gt_color, linewidth=1.0,
-                        linestyle=':', alpha=0.55, label='Neighbors GT')
+                ax.plot([], [], color=neighbor_gt_color, linewidth=1.0, linestyle=':',
+                        alpha=0.85, marker='x', markersize=4, label='Vecinos GT')
 
-        # ---- Historia del ego ----
+        # Ego hist
         ax.plot(ego_hist[:, 0], ego_hist[:, 1],
-                color=ego_color, linewidth=2.5, linestyle='-', alpha=0.7,
-                marker='o', markersize=5, label='Ego History')
+                color=ego_color, linewidth=2.5, linestyle='-', alpha=0.7, label='Ego History')
 
-        # ---- GT del ego ----
+        # Ego GT (tachitas)
         ax.plot(ego_gt[:, 0], ego_gt[:, 1],
-                color=ego_gt_color, linewidth=2, linestyle=':', alpha=0.9,
-                marker='x', markersize=7, label='Ego GT')
+                color=ego_gt_color, linewidth=2.0, linestyle=':',
+                alpha=0.95, marker='x', markersize=7, markevery=1, label='Ego GT')
 
-        # ---- Trayectoria del modo k ----
-        traj = ego_top3_trajs[k]  # (pred_len, 2)
+        # Ego pred (línea limpia)
+        traj = ego_topk_trajs[k]
         ax.plot(traj[:, 0], traj[:, 1],
-                color=mode_colors[k], linewidth=3, linestyle='--', alpha=0.95,
-                marker='s', markersize=5, label=mode_labels[k])
+                color=mode_colors[k % len(mode_colors)], linewidth=3, linestyle='--',
+                alpha=0.95, label=mode_labels[k])
 
-        # Conector historia → predicción ego
-        ax.plot([ego_hist[-1, 0], traj[0, 0]],
-                [ego_hist[-1, 1], traj[0, 1]],
-                color=mode_colors[k], linewidth=1, linestyle='--', alpha=0.4)
-
-        # Puntos clave ego
-        ax.scatter(ego_hist[0, 0], ego_hist[0, 1],
-                   color='darkblue', s=100, marker='o', edgecolors='black',
-                   linewidths=1.5, zorder=10)
-        ax.scatter(ego_hist[-1, 0], ego_hist[-1, 1],
-                   color=ego_color, s=140, marker='o', edgecolors='black',
-                   linewidths=1.5, zorder=10)
-        ax.scatter(traj[-1, 0], traj[-1, 1],
-                   color=mode_colors[k], s=160, marker='*', edgecolors='black',
-                   linewidths=1.5, zorder=10)
+        # Conector tenue (opcional)
+        ax.plot([ego_hist[-1, 0], traj[0, 0]], [ego_hist[-1, 1], traj[0, 1]],
+                color=mode_colors[k % len(mode_colors)], linewidth=0.6, linestyle='--', alpha=0.12)
 
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
-        # xlim == ylim → subplot ya es cuadrado; set_aspect forzaría redimensionar el axes
-        ax.set_aspect('equal', adjustable='datalim')
-        # Título con score si está disponible
-        if ego_top3_scores is not None:
-            title = f'{mode_labels[k]}\nScore: {ego_top3_scores[k]:.1%}'
+        ax.set_aspect('equal', adjustable='box')
+
+        if ego_topk_scores is not None:
+            title = f'{mode_labels[k]}\nProb: {ego_topk_scores[k]:.1%}'
         else:
             title = mode_labels[k]
+
         ax.set_title(title, fontsize=13, fontweight='bold')
         ax.set_xlabel('X (m)', fontsize=11)
         ax.set_ylabel('Y (m)', fontsize=11)
@@ -330,9 +144,348 @@ def plot_ego_top3_modes(ego_hist, ego_gt, ego_top3_trajs,
     plt.tight_layout()
 
     if save_path is not None:
-        os.makedirs(save_path, exist_ok=True)
-        filepath = os.path.join(save_path, f'top3_modes_sample_{sample_id:04d}.png')
+        _ensure_dir(save_path)
+        filepath = os.path.join(save_path, f'topk_modes_sample_{sample_id:04d}.png')
         plt.savefig(filepath, dpi=150, bbox_inches='tight')
         print(f"Saved: {filepath}")
 
     plt.close()
+
+
+# =========================================================
+# VAE: FINAL ONLY (una sola escena)
+# =========================================================
+def plot_vae_final_scenario(
+    ego_hist,
+    ego_gt,
+    ego_pred,
+    neighbors_hist=None,
+    neighbors_gt=None,
+    neighbors_pred=None,
+    neighbors_valid=None,
+    selected_idx=None,
+    save_path=None,
+    sample_id=0,
+    predictor_type="vae_final"
+):
+    """
+    VAE (final-only):
+    - Predicciones: líneas limpias
+    - GT: tachitas 'x' en cada paso
+    """
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    ego_hist_color = '#FF0000'
+    ego_gt_color = '#8B0000'
+    ego_pred_color = '#FF8C00'
+
+    neighbor_hist_color = '#0000FF'
+    neighbor_gt_color = '#000080'
+    neighbor_pred_color = '#00AA00'
+
+    ax.plot(ego_hist[:, 0], ego_hist[:, 1],
+            color=ego_hist_color, linewidth=1.5, alpha=0.75, label="Ego Hist")
+
+    ax.plot(ego_gt[:, 0], ego_gt[:, 1],
+            color=ego_gt_color, linewidth=3, linestyle=':',
+            alpha=0.95, marker='x', markersize=6, markevery=1, label="Ego GT")
+
+    ax.plot(ego_pred[:, 0], ego_pred[:, 1],
+            color=ego_pred_color, linewidth=2.5, linestyle='-',
+            alpha=0.95, label="Ego Pred (final)")
+
+    if neighbors_hist is not None:
+        for i in range(neighbors_hist.shape[0]):
+            valid_i = True
+            if neighbors_valid is not None:
+                valid_i = bool(neighbors_valid[i])
+            elif np.sum(np.abs(neighbors_hist[i])) == 0:
+                valid_i = False
+            if not valid_i:
+                continue
+
+            ax.plot(neighbors_hist[i, :, 0], neighbors_hist[i, :, 1],
+                    color=neighbor_hist_color, linewidth=1.0, alpha=0.45)
+
+            if neighbors_pred is not None and i < neighbors_pred.shape[0]:
+                ax.plot(neighbors_pred[i, :, 0], neighbors_pred[i, :, 1],
+                        color=neighbor_pred_color, linewidth=1.0, linestyle='--', alpha=0.6)
+
+            if neighbors_gt is not None and i < neighbors_gt.shape[0] and np.sum(np.abs(neighbors_gt[i])) > 0:
+                ax.plot(neighbors_gt[i, :, 0], neighbors_gt[i, :, 1],
+                        color=neighbor_gt_color, linewidth=1.0, linestyle=':',
+                        alpha=0.85, marker='x', markersize=4, markevery=1)
+
+        ax.plot([], [], color=neighbor_hist_color, linewidth=1.0, alpha=0.45, label="Vecinos Hist")
+        if neighbors_pred is not None:
+            ax.plot([], [], color=neighbor_pred_color, linewidth=1.0, linestyle='--', alpha=0.6, label="Vecinos Pred")
+        if neighbors_gt is not None:
+            ax.plot([], [], color=neighbor_gt_color, linewidth=1.0, linestyle=':', alpha=0.85,
+                    marker='x', markersize=4, label="Vecinos GT")
+
+    # Auto-límites
+    all_x = [ego_hist[:, 0], ego_gt[:, 0], ego_pred[:, 0]]
+    all_y = [ego_hist[:, 1], ego_gt[:, 1], ego_pred[:, 1]]
+
+    if neighbors_hist is not None:
+        for i in range(neighbors_hist.shape[0]):
+            valid_i = True
+            if neighbors_valid is not None:
+                valid_i = bool(neighbors_valid[i])
+            elif np.sum(np.abs(neighbors_hist[i])) == 0:
+                valid_i = False
+            if valid_i:
+                all_x.append(neighbors_hist[i, :, 0])
+                all_y.append(neighbors_hist[i, :, 1])
+
+    if neighbors_gt is not None:
+        for i in range(neighbors_gt.shape[0]):
+            if np.sum(np.abs(neighbors_gt[i])) > 0:
+                all_x.append(neighbors_gt[i, :, 0])
+                all_y.append(neighbors_gt[i, :, 1])
+
+    if neighbors_pred is not None:
+        all_x.append(neighbors_pred[:, :, 0].ravel())
+        all_y.append(neighbors_pred[:, :, 1].ravel())
+
+    all_x = np.concatenate(all_x)
+    all_y = np.concatenate(all_y)
+
+    margin = 0.1
+    x_range = max(all_x.max() - all_x.min(), 1e-6)
+    y_range = max(all_y.max() - all_y.min(), 1e-6)
+    ax.set_xlim(all_x.min() - margin * x_range, all_x.max() + margin * x_range)
+    ax.set_ylim(all_y.min() - margin * y_range, all_y.max() + margin * y_range)
+
+    title = f'VAE final scenario — Sample {sample_id}'
+    if selected_idx is not None:
+        title += f' | selected_k={selected_idx}'
+    ax.set_title(title, fontsize=16, fontweight='bold', pad=20)
+
+    ax.set_xlabel('X (m)', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Y (m)', fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+    ax.set_aspect('equal', adjustable='box')
+    ax.legend(loc='best', fontsize=10, framealpha=0.85)
+
+    plt.tight_layout()
+    if save_path is not None:
+        _ensure_dir(save_path)
+        filepath = os.path.join(save_path, f'vae_final_scene_{sample_id:04d}.png')
+        plt.savefig(filepath, dpi=150, bbox_inches='tight')
+        print(f"Saved: {filepath}")
+    plt.close()
+
+
+# =========================================================
+# VAE: MULTISAMPLE (K muestras)
+# =========================================================
+def plot_vae_multisample_scenarios(
+    ego_hist,
+    ego_gt,
+    ego_samples_trajs,
+    neighbors_hist=None,
+    neighbor_samples_preds=None,
+    neighbors_gt=None,
+    neighbors_valid=None,
+    z_values=None,
+    selected_idx=None,
+    save_path=None,
+    sample_id=0,
+    predictor_type="vae"
+):
+    """
+    VAE multisample:
+    - Predicciones: líneas limpias (ego y vecinos, sin markers)
+    - GT: tachitas 'x' en cada paso (ego y vecinos)
+    - Conector hist->pred muy tenue
+    """
+    K = ego_samples_trajs.shape[0]
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    ego_hist_color = '#FF0000'
+    ego_gt_color = '#8B0000'
+    neighbor_hist_color = '#0000FF'
+    neighbor_gt_color = '#000080'
+    cmap = plt.cm.get_cmap('tab10', max(K, 1))
+
+    ax.plot(ego_hist[:, 0], ego_hist[:, 1],
+            color=ego_hist_color, linewidth=1.5, alpha=0.75, label='Ego History')
+
+    ax.plot(ego_gt[:, 0], ego_gt[:, 1],
+            color=ego_gt_color, linewidth=3, linestyle=':',
+            alpha=0.95, marker='x', markersize=6, markevery=1, label='Ego GT')
+
+    if neighbors_hist is not None:
+        for i in range(neighbors_hist.shape[0]):
+            valid_i = True
+            if neighbors_valid is not None:
+                valid_i = bool(neighbors_valid[i])
+            elif np.sum(np.abs(neighbors_hist[i])) == 0:
+                valid_i = False
+            if not valid_i:
+                continue
+
+            ax.plot(neighbors_hist[i, :, 0], neighbors_hist[i, :, 1],
+                    color=neighbor_hist_color, linewidth=1.2, alpha=0.5)
+
+            if neighbors_gt is not None and i < neighbors_gt.shape[0] and np.sum(np.abs(neighbors_gt[i])) > 0:
+                ax.plot(neighbors_gt[i, :, 0], neighbors_gt[i, :, 1],
+                        color=neighbor_gt_color, linewidth=1.2, linestyle=':',
+                        alpha=0.85, marker='x', markersize=4, markevery=1)
+
+        ax.plot([], [], color=neighbor_hist_color, linewidth=1.2, alpha=0.5, label='Vecinos Hist')
+        if neighbors_gt is not None:
+            ax.plot([], [], color=neighbor_gt_color, linewidth=1.2, linestyle=':',
+                    alpha=0.85, marker='x', markersize=4, label='Vecinos GT')
+
+    for k in range(K):
+        color_k = cmap(k)
+        traj_k = ego_samples_trajs[k]
+
+        label_k = f'z sample {k}'
+        if selected_idx is not None and int(selected_idx) == k:
+            label_k = f'z sample {k} (selected)'
+
+        ax.plot(traj_k[:, 0], traj_k[:, 1],
+                color=color_k, linewidth=1.0, alpha=0.9, label=label_k)
+
+        ax.plot([ego_hist[-1, 0], traj_k[0, 0]], [ego_hist[-1, 1], traj_k[0, 1]],
+                color=color_k, linewidth=0.5, linestyle='--', alpha=0.12)
+
+        if neighbor_samples_preds is not None:
+            preds_k = neighbor_samples_preds[k]  # (N,T,2)
+            for i in range(preds_k.shape[0]):
+                valid_i = True
+                if neighbors_valid is not None and i < len(neighbors_valid):
+                    valid_i = bool(neighbors_valid[i])
+                if not valid_i:
+                    continue
+                ax.plot(preds_k[i, :, 0], preds_k[i, :, 1],
+                        color=color_k, linewidth=0.9, alpha=0.75)
+
+    # límites
+    all_x = [ego_hist[:, 0], ego_gt[:, 0], ego_samples_trajs[:, :, 0].ravel()]
+    all_y = [ego_hist[:, 1], ego_gt[:, 1], ego_samples_trajs[:, :, 1].ravel()]
+    if neighbors_hist is not None:
+        for i in range(neighbors_hist.shape[0]):
+            valid_i = True
+            if neighbors_valid is not None:
+                valid_i = bool(neighbors_valid[i])
+            elif np.sum(np.abs(neighbors_hist[i])) == 0:
+                valid_i = False
+            if valid_i:
+                all_x.append(neighbors_hist[i, :, 0])
+                all_y.append(neighbors_hist[i, :, 1])
+    if neighbors_gt is not None:
+        for i in range(neighbors_gt.shape[0]):
+            if np.sum(np.abs(neighbors_gt[i])) > 0:
+                all_x.append(neighbors_gt[i, :, 0])
+                all_y.append(neighbors_gt[i, :, 1])
+    if neighbor_samples_preds is not None:
+        all_x.append(neighbor_samples_preds[:, :, :, 0].ravel())
+        all_y.append(neighbor_samples_preds[:, :, :, 1].ravel())
+
+    all_x = np.concatenate(all_x)
+    all_y = np.concatenate(all_y)
+    margin = 0.1
+    x_range = max(all_x.max() - all_x.min(), 1e-6)
+    y_range = max(all_y.max() - all_y.min(), 1e-6)
+    ax.set_xlim(all_x.min() - margin * x_range, all_x.max() + margin * x_range)
+    ax.set_ylim(all_y.min() - margin * y_range, all_y.max() + margin * y_range)
+
+    ax.set_title(f'VAE sampled scenarios — Sample {sample_id} ({predictor_type}) | K={K}',
+                 fontsize=16, fontweight='bold', pad=20)
+
+    ax.set_xlabel('X (m)', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Y (m)', fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+    ax.set_aspect('equal', adjustable='box')
+    # ax.legend(...)  # opcional
+
+    plt.tight_layout()
+    if save_path is not None:
+        _ensure_dir(save_path)
+        filepath = os.path.join(save_path, f'vae_multisample_scene_{sample_id:04d}.png')
+        plt.savefig(filepath, dpi=150, bbox_inches='tight')
+        print(f"Saved: {filepath}")
+    plt.close()
+
+
+# =========================================================
+# Dispatcher
+# =========================================================
+def save_visualizations_from_samples(samples_data, save_path, predictor_type="standard"):
+    """
+    Soporta:
+    - standard: top-k
+    - vae: samples con kind="vae_final" o kind="vae_multi"
+    """
+    _ensure_dir(save_path)
+
+    if predictor_type == "standard":
+        topk_dir = os.path.join(save_path, "topk_modes")
+        _ensure_dir(topk_dir)
+
+        for idx, data in enumerate(samples_data):
+            plot_ego_topk_modes(
+                ego_hist=np.asarray(data["ego_hist"]),
+                ego_gt=np.asarray(data["ego_gt"]),
+                ego_topk_trajs=np.asarray(data["ego_topk_trajs"]),
+                ego_topk_scores=np.asarray(data["ego_topk_scores"]) if "ego_topk_scores" in data else None,
+                ego_topk_nb_preds=np.asarray(data["ego_topk_nb_preds"]) if "ego_topk_nb_preds" in data else None,
+                neighbors_hist=np.asarray(data["neighbors_hist"]) if "neighbors_hist" in data else None,
+                neighbors_valid=np.asarray(data["neighbors_valid"]) if "neighbors_valid" in data else None,
+                neighbors_gt=np.asarray(data["neighbors_gt"]) if "neighbors_gt" in data else None,
+                save_path=topk_dir,
+                sample_id=idx,
+                predictor_type=predictor_type
+            )
+
+    elif predictor_type == "vae":
+        vae_root = os.path.join(save_path, "vae")
+        _ensure_dir(vae_root)
+
+        for idx, data in enumerate(samples_data):
+            kind = data.get("kind", "vae_multi")
+
+            if kind == "vae_final":
+                out_dir = os.path.join(vae_root, "vae_final")
+                _ensure_dir(out_dir)
+                plot_vae_final_scenario(
+                    ego_hist=np.asarray(data["ego_hist"]),
+                    ego_gt=np.asarray(data["ego_gt"]),
+                    ego_pred=np.asarray(data["ego_pred"]),
+                    neighbors_hist=np.asarray(data["neighbors_hist"]) if "neighbors_hist" in data else None,
+                    neighbors_gt=np.asarray(data["neighbors_gt"]) if "neighbors_gt" in data else None,
+                    neighbors_pred=np.asarray(data["neighbors_pred"]) if "neighbors_pred" in data else None,
+                    neighbors_valid=np.asarray(data["neighbors_valid"]) if "neighbors_valid" in data else None,
+                    selected_idx=data.get("selected_idx", None),
+                    save_path=out_dir,
+                    sample_id=idx,
+                    predictor_type="vae_final"
+                )
+
+            elif kind == "vae_multi":
+                out_dir = os.path.join(vae_root, "vae_multisample")
+                _ensure_dir(out_dir)
+                plot_vae_multisample_scenarios(
+                    ego_hist=np.asarray(data["ego_hist"]),
+                    ego_gt=np.asarray(data["ego_gt"]),
+                    ego_samples_trajs=np.asarray(data["ego_samples_trajs"]),
+                    neighbors_hist=np.asarray(data["neighbors_hist"]) if "neighbors_hist" in data else None,
+                    neighbor_samples_preds=np.asarray(data["neighbor_samples_preds"]) if "neighbor_samples_preds" in data else None,
+                    neighbors_gt=np.asarray(data["neighbors_gt"]) if "neighbors_gt" in data else None,
+                    neighbors_valid=np.asarray(data["neighbors_valid"]) if "neighbors_valid" in data else None,
+                    z_values=np.asarray(data["z"]) if "z" in data else None,
+                    selected_idx=data.get("selected_idx", None),
+                    save_path=out_dir,
+                    sample_id=idx,
+                    predictor_type="vae"
+                )
+
+            else:
+                print(f"[WARN] Unknown VAE sample kind '{kind}', skipping idx={idx}")
+
+    else:
+        raise ValueError(f"Unknown predictor_type: {predictor_type}")
