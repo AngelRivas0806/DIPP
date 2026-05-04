@@ -73,7 +73,7 @@ class DecoderVAE(nn.Module):
         return trajs
     
 class EgoDecoderVAE(nn.Module):
-    def __init__(self, future_steps, token_dims, num_cost_weights=5):
+    def __init__(self, future_steps, token_dims, num_cost_weights=6):
         super(EgoDecoderVAE, self).__init__()
         self._future_steps = future_steps
 
@@ -111,13 +111,13 @@ class EgoDecoderVAE(nn.Module):
          # cost_weights: generados por MLP desde dummy input fijo
         # El MLP aprende qué pesos son óptimos durante el entrenamiento
         raw_weights = self.cost_mlp(self.dummy_input)           # (1, num_cost_weights)
-        positive_weights = F.softplus(raw_weights)              # garantizar positividad
+        positive_weights = F.softplus(raw_weights) + 1e-3             # garantizar positividad
         cost_function_weights = positive_weights.expand(B, -1).contiguous()  # (B, num_cost_weights)
 
         return actions, cost_function_weights
 
 class PredictorVAE(nn.Module):
-    def __init__(self, future_steps, embed_dim=256, num_neighbors=10, num_modes=1, predict_positions=False):
+    def __init__(self, future_steps, embed_dim=256, num_neighbors=10, num_modes=1, predict_positions=False, use_prior = bool):
         super(PredictorVAE, self).__init__()
         self._future_steps  = future_steps
         self._num_neighbors = num_neighbors 
@@ -126,12 +126,10 @@ class PredictorVAE(nn.Module):
         self.agent_agent_net= Agent2AgentVAE(modes=num_modes, tokens_dim=embed_dim) # Inter agent attention module
         self.ego_decoder = EgoDecoderVAE(future_steps=self._future_steps, token_dims=288)
         self.neighbor_decoder = DecoderVAE(future_steps=self._future_steps, token_dims=288, num_neighbors=num_neighbors, predict_positions=predict_positions)
-        self.priori_distribution = mlp_gaussian(input_dim=embed_dim*2, hidden_dim=256, output_dim=64)  # (B, 64) -> (B, 32) for mu and (B, 32) for logvar
+        self.priori_distribution = mlp_gaussian(input_dim=embed_dim, hidden_dim=256, output_dim=64)  # (B, 64) -> (B, 32) for mu and (B, 32) for logvar
         self.posterior_distribution = mlp_gaussian(input_dim=embed_dim*2, hidden_dim=256, output_dim=64)  # (B, 64) -> (B, 32) for mu and (B, 32) for logvar
         self.reparametrization_train = reparametrization()
-        self.score          = Score(num_modes=1, tokens_dim=embed_dim)  # Scoring module for the modes (B, N) - optional, can be used for mode selection or as an auxiliary loss
-
-
+        self.use_prior = use_prior
 
     def forward(self, ego, neighbors, ground_truth):
         """
@@ -177,15 +175,17 @@ class PredictorVAE(nn.Module):
 
         encoder_train = torch.cat([agent_agent_gap, agent_agent_future_gap], dim=-1)  # (B, 1, 512)
 
-        # Priori distribution (Constante o no)
-        # priori = self.priori_distribution(encoder_train)  # (B, 64)
-        # priori_mu, priori_logvar = priori[:, :32], priori[:, 32:64]
+        """Priori distribution"""
+        priori_mu = None
+        priori_logvar = None
 
-        #  Posterior distribution 
-        posterior = self.posterior_distribution(encoder_train)  # (B, 64)
-        posterior_mu, posterior_logvar = posterior[:, :, :32], posterior[:, :, 32:64]
-        # print(f"posterior_mu.shape: {posterior_mu.shape}")
-        # print(f"posterior_logvar.shape: {posterior_logvar.shape}")
+        if self.use_prior:
+            priori = self.priori_distribution(agent_agent_gap)  # (B, 1, 64)
+            priori_mu, priori_logvar = priori.chunk(2, dim=-1)  # (B, 1, 32), (B, 1, 32)
+
+        # Posterior distribution
+        posterior = self.posterior_distribution(encoder_train)  # (B, 1, 64)
+        posterior_mu, posterior_logvar = posterior.chunk(2, dim=-1)
         # Sample z
 
         z = self.reparametrization_train(posterior_mu, posterior_logvar)
@@ -213,7 +213,7 @@ class PredictorVAE(nn.Module):
         predictions = self.neighbor_decoder(neighbor_conditioned, current_state_neighbors)  # (B,N,T,2)
         predictions = predictions.unsqueeze(1)  # (B,1,N,T,2)
 
-        return plans, predictions, cost_function_weights, posterior_mu, posterior_logvar
+        return plans, predictions, cost_function_weights, posterior_mu, posterior_logvar, priori_mu, priori_logvar
 
     def inference(self, ego, neighbors, z=None, num_samples=1):
 

@@ -3,19 +3,34 @@ import theseus as th
 from utils.train_utils import bicycle_model  
 
 # =========================
-# Helpers
+# u: (B, 2T) -> control: (B, T, 2)
 # =========================
 def _reshape_control(u: torch.Tensor):
-    """
-    u: (B, 2T) -> control: (B, T, 2)
-    """
     T = u.shape[-1] // 2
     return u.view(-1, T, 2), T
-
 
 # =========================
 # Residual functions
 # =========================
+def speed_limit_residual(optim_vars, aux_vars):
+    u = optim_vars[0].tensor
+    control, T = _reshape_control(u)
+
+    current_state = aux_vars[0].tensor
+    dt = aux_vars[1].tensor[0]
+    max_speed = aux_vars[2].tensor[0]
+
+    ego_current_state = current_state[:, 0]
+
+    ego_traj = bicycle_model(control, ego_current_state, dt=dt)
+
+    # bicycle_model devuelve [x, y, theta, v]
+    speed = ego_traj[:, :, 3]
+
+    speed_violation = torch.clamp(speed - max_speed, min=0.0)
+
+    return speed_violation
+
 def acceleration_residual(optim_vars, aux_vars):
     u = optim_vars[0].tensor                 # (B, 2T)
     control, T = _reshape_control(u)         # (B, T, 2)
@@ -121,42 +136,31 @@ def trajectory_following_residual(optim_vars, aux_vars):
 # Objective builder
 # =========================
 def build_objective(
-    objective: th.Objective,
-    control_variables: th.Vector,
-    current_state: th.Variable,
+    objective: th.Objective, # Contenedor para agregar residuales, el optimizador minimiza la suma de estos.
+    control_variables: th.Vector, # Variable de optimizacion (control), lo que Theseus ajusta
+    current_state: th.Variable, # th.variable son variables auxiliares no optimizables
     predictions: th.Variable,
     weights: dict,
     trajectory_len: int,
     dt_var: th.Variable,
     safety_distance_var: th.Variable,
+    max_speed_var: th.Variable,
     vectorize: bool = True,
 ):
     T = trajectory_len
     Tm1 = max(T - 1, 1)
 
     # Comfort
-    objective.add(th.AutoDiffCostFunction(
-        [control_variables], acceleration_residual, T,
-        weights["acc"], autograd_vectorize=vectorize, name="acceleration"
-    ))
-    objective.add(th.AutoDiffCostFunction(
-        [control_variables], jerk_residual, Tm1,
-        weights["jerk"], aux_vars=[dt_var], autograd_vectorize=vectorize, name="jerk"
-    ))
-    objective.add(th.AutoDiffCostFunction(
-        [control_variables], steering_residual, T,
-        weights["steer"], autograd_vectorize=vectorize, name="steering"
-    ))
-    objective.add(th.AutoDiffCostFunction(
-        [control_variables], steering_change_residual, Tm1,
-        weights["steer_change"], aux_vars=[dt_var], autograd_vectorize=vectorize, name="steering_change"
-    ))
-
+    objective.add(th.AutoDiffCostFunction([control_variables], acceleration_residual, T, weights["acc"], autograd_vectorize=vectorize, name="acceleration"))
+    objective.add(th.AutoDiffCostFunction([control_variables], jerk_residual, Tm1, weights["jerk"], aux_vars=[dt_var], autograd_vectorize=vectorize, name="jerk"))
+    objective.add(th.AutoDiffCostFunction([control_variables], steering_residual, T, weights["steer"], autograd_vectorize=vectorize, name="steering"))
+    objective.add(th.AutoDiffCostFunction([control_variables], steering_change_residual, Tm1, weights["steer_change"], aux_vars=[dt_var], autograd_vectorize=vectorize, name="steering_change"))
     # Safety
-    objective.add(th.AutoDiffCostFunction(
-        [control_variables], collision_avoidance_residual, T,
-        weights["collision"],
-        aux_vars=[predictions, current_state, dt_var, safety_distance_var],
+        # Speed limit
+    objective.add(th.AutoDiffCostFunction([control_variables], speed_limit_residual, T, weights["speed_limit"], aux_vars=[current_state, dt_var, max_speed_var], autograd_vectorize=vectorize,
+        name="speed_limit"
+    ))
+    objective.add(th.AutoDiffCostFunction([control_variables], collision_avoidance_residual, T, weights["collision"], aux_vars=[predictions, current_state, dt_var, safety_distance_var],
         autograd_vectorize=vectorize,
         name="collision_avoidance"
     ))
@@ -176,8 +180,10 @@ class MotionPlanner:
       - steer_change
       - collision
     """
-    def __init__(self, trajectory_len: int, device, test: bool = False, dt: float = 0.1, safety_distance: float = 0.5):
+    def __init__(self, trajectory_len: int, device, test: bool = False, dt: float = 0.4, safety_distance: float = 0.5, max_speed: float = 1.5):
+
         self.device = torch.device(device)
+
         if self.device.type == "cuda":
             torch.cuda.set_device(self.device.index or 0)
         self.T = trajectory_len
@@ -190,19 +196,22 @@ class MotionPlanner:
         # Aux scalars as Variables
         self.dt_var = th.Variable(torch.tensor([dt]), name="dt")
         self.safety_distance_var = th.Variable(torch.tensor([safety_distance]), name="safety_distance")
+        self.max_speed_var = th.Variable(torch.tensor([max_speed], dtype=torch.float32, device=self.device), name="max_speed")
 
-        # Learnable weights (5 costos, sin tracking)
+        # Learnable weights (5)
         self.cost_weights_vars = {
             "acc":          th.Variable(torch.rand(1), name="w_acc"),
             "jerk":         th.Variable(torch.rand(1), name="w_jerk"),
             "steer":        th.Variable(torch.rand(1), name="w_steer"),
             "steer_change": th.Variable(torch.rand(1), name="w_steer_change"),
             "collision":    th.Variable(torch.rand(1), name="w_collision"),
+            "speed_limit":  th.Variable(torch.rand(1), name="w_speed_limit"),
         }
         self.cost_weights = {k: th.ScaleCostWeight(v) for k, v in self.cost_weights_vars.items()}
 
         # Objective
         objective = th.Objective()
+
         self.objective = build_objective(
             objective=objective,
             control_variables=self.control_variables,
@@ -212,6 +221,7 @@ class MotionPlanner:
             trajectory_len=trajectory_len,
             dt_var=self.dt_var,
             safety_distance_var=self.safety_distance_var,
+            max_speed_var=self.max_speed_var,
             vectorize=False,
         )
 
@@ -219,13 +229,13 @@ class MotionPlanner:
         if test:
             self.optimizer = th.GaussNewton(
                 objective, th.CholeskyDenseSolver,
-                vectorize=False, max_iterations=10, step_size=0.3, abs_err_tolerance=1e-2
+                vectorize=False, max_iterations=3, step_size=0.3, abs_err_tolerance=1e-2
             )
         else:
             self.optimizer = th.GaussNewton(
                 objective, th.LUDenseSolver,
-                vectorize=False, max_iterations=5, step_size=0.3
+                vectorize=False, max_iterations=10, step_size=0.3
             )
 
         self.layer = th.TheseusLayer(self.optimizer, vectorize=False)
-        self.layer.to(self.device)   # <-- no encadenes
+        self.layer.to(self.device)  

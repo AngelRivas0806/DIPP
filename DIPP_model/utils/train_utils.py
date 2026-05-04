@@ -271,7 +271,7 @@ def MFMA_loss(plans, predictions, scores, ground_truth, weights, best_mode: Opti
 # Loss for VAE
 # ==================================================
 
-def VAE_loss(plans, predictions, ground_truth, weights, mu, logvar, ego_in_pred_loss: bool = True, beta: float = 1.0):
+def VAE_loss(plans, predictions, ground_truth, weights, mu, logvar, ego_in_pred_loss: bool = True, beta: float = 1.0, prior_mu: Optional[torch.Tensor] = None, prior_logvar: Optional[torch.Tensor] = None):
 
     # plans:       (B, 1, T, 3)   -> (B, T, 3)
     # predictions: (B, 1, N, T, 2)-> (B, N, T, 2)
@@ -314,10 +314,19 @@ def VAE_loss(plans, predictions, ground_truth, weights, mu, logvar, ego_in_pred_
  
     pred_loss = pred_loss + nei_l
 
-    # Pérdida KL del VAE
-    # KL(q(z|x) || N(0, I))
-    # Primero sumamos en latent_dim, luego promediamos en batch
-    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+    
+    if prior_mu is not None and prior_logvar is not None:
+        var_q = torch.exp(logvar)
+        var_p = torch.exp(prior_logvar)
+
+        kl = 0.5 * (prior_logvar - logvar + (var_q + (mu - prior_mu).pow(2)) / var_p - 1.0)
+
+        # Sumamos sobre latent_dim y promediamos sobre batch
+        kl_loss = kl.sum(dim=1).mean()
+
+    else:
+
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
 
     total_loss = pred_loss + beta * kl_loss
 

@@ -32,7 +32,7 @@ class AgentEncoder(nn.Module):
 
 """Multi-modal transformer module is used for agent2map, so we commented that code , we modified agent2agent to use it as well"""
 class MultiModalTransformer(nn.Module):
-    def __init__(self, modes, tokens_dim, output_dim=256):
+    def __init__(self, modes, tokens_dim=256, output_dim=256):
         super(MultiModalTransformer, self).__init__()
         self.modes     = modes
         self.attention = nn.ModuleList([nn.MultiheadAttention(tokens_dim, 4, 0.1, batch_first=True) for _ in range(modes)])
@@ -47,9 +47,35 @@ class MultiModalTransformer(nn.Module):
 
         return output
 
+"""
+Agent2Agent uses multimodal transformer to predict multiple future for each scene.
+"""
+class Agent2Agent(nn.Module):
+    def __init__(self, modes: int, tokens_dim: int):
+        super(Agent2Agent, self).__init__()
+        self.modes = modes
+
+        encoder_layer = nn.TransformerEncoderLayer(d_model=tokens_dim, nhead=4, dim_feedforward=1024, activation='relu', batch_first=True)
+        self.interaction_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
+
+        # Multi-modal attention to generate multiple interpretations
+        self.multimodal = MultiModalTransformer(modes=modes, tokens_dim=256, output_dim=256)
+
+    def forward(self, inputs, mask=None):
+        # (B, A, E)
+        encoded = self.interaction_net(inputs, src_key_padding_mask=mask)
+
+        # (B, M, A, E)
+        # output = encoded.unsqueeze(1).expand(-1, self.modes, -1, -1).clone()
+
+        # ruido distinto por modo para romper el colapso
+        query = encoded  # (batch, num_agents, 256)
+        output = self.multimodal(query, encoded, encoded, mask)
+
+        return output
 
 """
-Agent2Agent
+Agent2AgentVAE
 Module that models the interactions between agents using a transformer encoder.
 """
 class Agent2AgentVAE(nn.Module):
@@ -67,38 +93,8 @@ class Agent2AgentVAE(nn.Module):
         encoded = self.interaction_net(inputs, src_key_padding_mask=mask)
         # Expand the encoded features to have a separate version for each mode
         output = encoded.unsqueeze(1).expand(-1, self.modes, -1, -1)  # (B,M,N,E)
-        if False:
-            # Produce Gaussian noise in size (B,1,N,E) and add it to the output to encourage diversity in the modes
-            noise = torch.randn_like(output[:, :1, :, :]) * 0.1 
-            output= output + noise
         return output
 
-class Agent2Agent(nn.Module):
-    def __init__(self, modes: int, tokens_dim: int):
-        super(Agent2Agent, self).__init__()
-        self.modes = modes
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=tokens_dim,
-            nhead=4,
-            dim_feedforward=1024,
-            activation='relu',
-            batch_first=True
-        )
-        self.interaction_net = nn.TransformerEncoder(encoder_layer, num_layers=2)
-
-    def forward(self, inputs, mask=None):
-        # (B, A, E)
-        encoded = self.interaction_net(inputs, src_key_padding_mask=mask)
-
-        # (B, M, A, E)
-        output = encoded.unsqueeze(1).expand(-1, self.modes, -1, -1).clone()
-
-        # ruido distinto por modo para romper el colapso
-        noise = torch.randn_like(output) * 0.1
-        output = output + noise
-
-        return output
 
 """
 AgentDecoder
@@ -142,7 +138,7 @@ class AgentDecoder(nn.Module):
 
 
 class PlanDecoder(nn.Module):
-    def __init__(self, future_steps, token_dims, num_modes=NUM_MODES, num_cost_weights=5):
+    def __init__(self, future_steps, token_dims, num_modes=NUM_MODES, num_cost_weights=6):
         super(PlanDecoder, self).__init__()
         self._future_steps = future_steps
         self._num_modes    = num_modes
@@ -174,7 +170,7 @@ class PlanDecoder(nn.Module):
         # cost_weights: generados por MLP desde dummy input fijo
         # El MLP aprende qué pesos son óptimos durante el entrenamiento
         raw_weights = self.cost_mlp(self.dummy_input)           # (1, num_cost_weights)
-        positive_weights = F.softplus(raw_weights)              # garantizar positividad
+        positive_weights = F.softplus(raw_weights) + 1e-3            # garantizar positividad
         cost_function_weights = positive_weights.expand(B, -1).contiguous()  # (B, num_cost_weights)
 
         return actions, cost_function_weights
