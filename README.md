@@ -38,16 +38,18 @@ python process_eth_ucy.py \
   --leave_out ucy-zara02 \
   --split \
   --k_neighbors 10 \
-  --neighbor_radius 3.0
+  --neighbor_radius 7.0
 
 ```
-Posteriormente si quieres visualizar tus datos ejecuta:
+Posteriormente si quieres visualizar tus datos ejecuta: y agrega --show_obstacles si quieres visualizar mapa
 ```shell
 python vis.py --npz DIPP_model/data/train/data.npz --random --ego_frame --rotate
 ```
 ### 3.2 DIPP_model train (Whitout planning)
 If you want to use planning module use the flag --use_planning, in another case omit it.
-And if you want to train with the predictorVAE use the flag -- predictor PredictorVA.
+If you want to use maps use the flag --use_map, in another case omit it.
+
+And if you want to train with the predictorVAE use the flag -- predictor PredictorVAE.
 
  To use the standard predictor use the flag --predictor Predictor or simply omit it.
 ```shell

@@ -1,3 +1,4 @@
+from xml.parsers.expat import model
 import torch
 import argparse
 import numpy as np
@@ -12,7 +13,13 @@ from model.planner import MotionPlanner
 
 from utils.train_utils import DrivingData, bicycle_model, select_future
 from utils.visualization import save_visualizations_from_samples
+import warnings
 
+warnings.filterwarnings(
+    "ignore",
+    message="The PyTorch API of nested tensors is in prototype stage.*",
+    category=UserWarning
+)
 
 # =========================================================
 # Utils
@@ -28,6 +35,18 @@ def compute_ade_fde(predictions, ground_truth):
     fde = torch.mean(displacement[:, -1])
     return ade.item(), fde.item()
 
+
+def segs_ego_to_world(segs_ego, ego_center_world, heading_rad):
+    # segs_ego: (M,4) [x1,y1,x2,y2] en ego-frame
+    c, s = np.cos(heading_rad), np.sin(heading_rad)
+
+    R = np.array([[c, -s],
+                  [s,  c]], dtype=np.float32)
+
+    a = segs_ego[:, 0:2] @ R.T + ego_center_world
+    b = segs_ego[:, 2:4] @ R.T + ego_center_world
+
+    return np.concatenate([a, b], axis=1)
 
 def make_current_state(ego, neighbors):
     """
@@ -152,37 +171,53 @@ def compute_joint_scene_error(plan_trajs, predictions_all, ground_truth):
 # =========================================================
 
 @torch.no_grad()
-def run_batch_standard(model, ego, neighbors):
+def run_batch_standard(model, ego, neighbors, ground_truth=None,
+                       map_segments=None, map_mask=None, return_attn: bool = False):
     """
-    Predictor normal.
-    Returns dict with unified keys.
+    Predictor normal (multi-modal):
+      - sin mapa: model(ego, neighbors)
+      - con mapa: model(ego, neighbors, map_segments, map_mask)
+    Opcional: return_attn=True si tu Predictor.forward ya devuelve attn_w como 5to output.
     """
-    plans, predictions_all, scores, cost_function_weights = model(ego, neighbors)
-    num_modes = scores.shape[1]
+    attn_w = None
 
-    plan_trajs = torch.stack(
-        [bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(num_modes)],
-        dim=1
-    )  # (B, M, T, 3)
+    if return_attn:
+        if map_segments is None or map_mask is None:
+            plans, predictions_all, scores, cost_function_weights, attn_w = model(
+                ego, neighbors, return_attn=True
+            )
+        else:
+            plans, predictions_all, scores, cost_function_weights, attn_w = model(
+                ego, neighbors, map_segments, map_mask, return_attn=True
+            )
+    else:
+        if map_segments is None or map_mask is None:
+            plans, predictions_all, scores, cost_function_weights = model(ego, neighbors)
+        else:
+            plans, predictions_all, scores, cost_function_weights = model(ego, neighbors, map_segments, map_mask)
 
-    best_mode = torch.argmax(scores, dim=1)
-    best_plan_traj, best_prediction = select_future(plan_trajs, predictions_all, scores, best_mode)
-
+    num_modes = plans.shape[1]
     num_neighbors_expected = neighbors.shape[1]
     predictions_all = align_neighbor_predictions_all(predictions_all, num_neighbors_expected)
-    best_prediction = align_neighbor_predictions(best_prediction, num_neighbors_expected)
 
-    return {
+    plan_trajs = torch.stack(
+        [bicycle_model(plans[:, k], ego[:, -1])[:, :, :3] for k in range(num_modes)],
+        dim=1
+    )  # (B,K,T,3)
+
+    out = {
         "mode": "standard",
-        "plans": plans,                         # (B,M,T,2)
-        "predictions_all": predictions_all,     # (B,M,N,T,2)
-        "scores": scores,                       # (B,M)
-        "cost_function_weights": cost_function_weights,  # (B,5) o (B,M,5)
-        "plan_trajs": plan_trajs,               # (B,M,T,3)
-        "plan_traj": best_plan_traj,            # (B,T,3)
-        "prediction": best_prediction,          # (B,N,T,2)
+        "plans": plans,
+        "predictions_all": predictions_all,
+        "scores": scores,
+        "cost_function_weights": cost_function_weights,
+        "plan_trajs": plan_trajs,
         "num_modes": num_modes,
+        "ground_truth": ground_truth,
     }
+    if return_attn:
+        out["attn_w"] = attn_w
+    return out
 
 def pack_vis_sample_standard_topk(
     b, batch_start, ego, neighbors, ground_truth,
@@ -210,6 +245,10 @@ def pack_vis_sample_standard_topk(
 
     if raw_dataset is not None:
         raw_idx = batch_start + b
+        scene_id = None
+        if hasattr(raw_dataset, "scene_id") and raw_dataset.scene_id is not None:
+            scene_id = int(raw_dataset.scene_id[raw_idx])
+
         denorm_xy = denorm_xy_factory(raw_dataset, raw_idx)
         ego_hist = denorm_xy(ego_hist)
         ego_gt   = denorm_xy(ego_gt)
@@ -218,7 +257,7 @@ def pack_vis_sample_standard_topk(
         ego_samples_trajs = np.stack([denorm_xy(ego_samples_trajs[i]) for i in range(k)], axis=0)
         neighbor_samples  = np.stack([denorm_xy(neighbor_samples[i])  for i in range(k)], axis=0)
 
-    return {
+    out = {
         "kind": "standard_topk",
         "ego_hist": ego_hist,
         "ego_gt": ego_gt,
@@ -228,57 +267,89 @@ def pack_vis_sample_standard_topk(
         "num_valid_neighbors": int(n_valid),
 
         "ego_topk_trajs": ego_samples_trajs,          # (K,T,2)
-        "ego_topk_scores": topk_scores,               # (K,)  (si quieres)
-        "ego_topk_nb_preds": neighbor_samples,        # (K,N,T,2) (si quieres)
+        "ego_topk_scores": topk_scores,               # (K,)
+        "ego_topk_nb_preds": neighbor_samples,        # (K,N,T,2)
     }
 
+    # centro del ego (en world si raw_dataset existe, si no, en el frame actual)
+    out["ego_center"] = ego_hist[-1].copy()
+
+    if raw_dataset is not None:
+        out["scene_id"] = scene_id  # puede ser None si no existe
+
+    return out
+
 @torch.no_grad()
-def run_batch_vae(model, ego, neighbors, ground_truth=None, num_samples=1, vae_prior="fixed"):
+def run_batch_vae(
+    model,
+    ego,
+    neighbors,
+    ground_truth=None,
+    num_samples=1,
+    vae_prior="fixed",
+    map_segments=None,
+    map_mask=None,
+    return_attn: bool = False,
+):
     """
-    Predictor VAE:
-      - fixed  -> z ~ N(0,I)
-      - learned -> z ~ p(z|h) (prior aprendida condicionada al pasado)
-    Devuelve TODAS las muestras K.
+    PredictorVAE batch runner.
+
+    - vae_prior="fixed"   -> z ~ N(0, I)
+    - vae_prior="learned" -> z ~ p(z | past) (prior aprendida condicionada al pasado)
+
+    Si return_attn=True y el modelo lo soporta, regresa también attn_w
+    (esperado: (B, modes, heads, A, M) o similar dependiendo de tu implementación).
     """
 
-    # Llamada robusta: si tu PredictorVAE.inference ya soporta un flag, lo usamos.
-    # Si no, cae al comportamiento default (fixed).
+    want_attn = bool(return_attn)
+
+    # ---- Call inference (prefer keyword args, robust to older signatures) ----
     try:
-        if vae_prior == "learned":
-            outputs = model.inference(ego, neighbors, num_samples=num_samples, prior="learned")
-        else:
-            outputs = model.inference(ego, neighbors, num_samples=num_samples, prior="fixed")
+        outputs = model.inference(
+            ego,
+            neighbors,
+            map_segments=map_segments,
+            map_mask=map_mask,
+            num_samples=num_samples,
+            prior=("learned" if vae_prior == "learned" else "fixed"),
+            return_attn=want_attn,
+        )
     except TypeError:
-        # compatibilidad hacia atrás: tu inference quizá no acepta "prior="
-        # entonces:
-        # - learned: intenta otro nombre común
-        # - si no existe, cae a fixed (pero NO rompe)
-        if vae_prior == "learned":
-            if hasattr(model, "inference_learned_prior"):
-                outputs = model.inference_learned_prior(ego, neighbors, num_samples=num_samples)
-            else:
-                outputs = model.inference(ego, neighbors, num_samples=num_samples)
+        # Backward compatibility: model.inference may not accept some kwargs
+        if vae_prior == "learned" and hasattr(model, "inference_learned_prior"):
+            outputs = model.inference_learned_prior(ego, neighbors, num_samples=num_samples)
         else:
+            # Try without map + return_attn + prior
             outputs = model.inference(ego, neighbors, num_samples=num_samples)
 
-    if len(outputs) == 4:
-        plans, predictions_all, cost_function_weights, z = outputs
-    elif len(outputs) == 3:
-        plans, predictions_all, cost_function_weights = outputs
-        z = None
-    else:
-        raise ValueError("Salida inesperada de PredictorVAE.inference(...)")
+    # ---- Unpack outputs ----
+    z = None
+    attn_w = None
 
+    if isinstance(outputs, (list, tuple)):
+        if len(outputs) == 5:
+            plans, predictions_all, cost_function_weights, z, attn_w = outputs
+        elif len(outputs) == 4:
+            plans, predictions_all, cost_function_weights, z = outputs
+        elif len(outputs) == 3:
+            plans, predictions_all, cost_function_weights = outputs
+        else:
+            raise ValueError(f"Salida inesperada de PredictorVAE.inference(...): len={len(outputs)}")
+    else:
+        raise ValueError(f"Salida inesperada de PredictorVAE.inference(...): type={type(outputs)}")
+
+    # ---- Align neighbor predictions (safety) ----
     num_modes = plans.shape[1]
     num_neighbors_expected = neighbors.shape[1]
     predictions_all = align_neighbor_predictions_all(predictions_all, num_neighbors_expected)
 
+    # ---- Convert controls to trajectories ----
     plan_trajs = torch.stack(
         [bicycle_model(plans[:, k], ego[:, -1])[:, :, :3] for k in range(num_modes)],
         dim=1
     )  # (B,K,T,3)
 
-    return {
+    out = {
         "mode": "vae",
         "vae_prior": vae_prior,
         "plans": plans,
@@ -287,8 +358,12 @@ def run_batch_vae(model, ego, neighbors, ground_truth=None, num_samples=1, vae_p
         "plan_trajs": plan_trajs,
         "z": z,
         "num_modes": num_modes,
-        "ground_truth": ground_truth
+        "ground_truth": ground_truth,
     }
+    if want_attn:
+        out["attn_w"] = attn_w
+
+    return out
 
 
 # =========================================================
@@ -390,9 +465,6 @@ def pack_vis_sample_vae_final_only(
     final_plan_traj, final_prediction,
     raw_dataset=None
 ):
-    """
-    Guarda SOLO la escena final (una trayectoria) para VAE.
-    """
     ego_hist = ego[b, :, :2].cpu().numpy()
     ego_gt = ground_truth[b, 0, :, :2].cpu().numpy()
 
@@ -402,13 +474,16 @@ def pack_vis_sample_vae_final_only(
     neigh_valid = (neighbors[b, :, -1, 6] > 0).cpu().numpy()
     n_valid = int(np.sum([np.sum(np.abs(nb_hist[n])) > 0 for n in range(nb_hist.shape[0])]))
 
-    ego_pred = final_plan_traj[b, :, :2].cpu().numpy()        # (T,2)
-    nb_pred = final_prediction[b, :, :, :2].cpu().numpy()     # (N,T,2)
+    ego_pred = final_plan_traj[b, :, :2].cpu().numpy()
+    nb_pred = final_prediction[b, :, :, :2].cpu().numpy()
 
+    scene_id = None
     if raw_dataset is not None:
         raw_idx = batch_start + b
-        denorm_xy = denorm_xy_factory(raw_dataset, raw_idx)
+        if hasattr(raw_dataset, "scene_id") and raw_dataset.scene_id is not None:
+            scene_id = int(raw_dataset.scene_id[raw_idx])
 
+        denorm_xy = denorm_xy_factory(raw_dataset, raw_idx)
         ego_hist = denorm_xy(ego_hist)
         ego_gt = denorm_xy(ego_gt)
         nb_hist = denorm_xy(nb_hist)
@@ -416,7 +491,7 @@ def pack_vis_sample_vae_final_only(
         ego_pred = denorm_xy(ego_pred)
         nb_pred = denorm_xy(nb_pred)
 
-    return {
+    out = {
         "kind": "vae_final",
         "ego_hist": ego_hist,
         "ego_gt": ego_gt,
@@ -426,7 +501,13 @@ def pack_vis_sample_vae_final_only(
         "neighbors_pred": nb_pred,
         "neighbors_valid": neigh_valid,
         "num_valid_neighbors": int(n_valid),
+        "ego_center": ego_hist[-1].copy(),
     }
+
+    if scene_id is not None:
+        out["scene_id"] = scene_id
+
+    return out
 
 
 def pack_vis_sample_vae_multi_optional(
@@ -435,8 +516,7 @@ def pack_vis_sample_vae_multi_optional(
     raw_dataset=None
 ):
     """
-    Guarda K muestras del VAE (sin planner o como quieras) en una sola escena.
-    Esto es opcional (solo para visual).
+    Guarda K muestras del VAE en una sola escena (solo visualización).
     """
     ego_hist = ego[b, :, :2].cpu().numpy()
     ego_gt = ground_truth[b, 0, :, :2].cpu().numpy()
@@ -450,16 +530,27 @@ def pack_vis_sample_vae_multi_optional(
     ego_samples_trajs = plan_trajs_all[b, :, :, :2].cpu().numpy()            # (K,T,2)
     neighbor_samples_preds = predictions_all[b, :, :, :, :2].cpu().numpy()   # (K,N,T,2)
 
+    scene_id = None
     if raw_dataset is not None:
         raw_idx = batch_start + b
+
+        # escena para obstacles.txt
+        if hasattr(raw_dataset, "scene_id") and raw_dataset.scene_id is not None:
+            scene_id = int(raw_dataset.scene_id[raw_idx])
+
         denorm_xy = denorm_xy_factory(raw_dataset, raw_idx)
 
         ego_hist = denorm_xy(ego_hist)
         ego_gt = denorm_xy(ego_gt)
         nb_hist = denorm_xy(nb_hist)
         nb_gt = denorm_xy(nb_gt)
-        ego_samples_trajs = np.stack([denorm_xy(ego_samples_trajs[k]) for k in range(ego_samples_trajs.shape[0])], axis=0)
-        neighbor_samples_preds = np.stack([denorm_xy(neighbor_samples_preds[k]) for k in range(neighbor_samples_preds.shape[0])], axis=0)
+
+        ego_samples_trajs = np.stack(
+            [denorm_xy(ego_samples_trajs[k]) for k in range(ego_samples_trajs.shape[0])], axis=0
+        )
+        neighbor_samples_preds = np.stack(
+            [denorm_xy(neighbor_samples_preds[k]) for k in range(neighbor_samples_preds.shape[0])], axis=0
+        )
 
     out = {
         "kind": "vae_multi",
@@ -471,9 +562,15 @@ def pack_vis_sample_vae_multi_optional(
         "num_valid_neighbors": int(n_valid),
         "ego_samples_trajs": ego_samples_trajs,
         "neighbor_samples_preds": neighbor_samples_preds,
+        "ego_center": ego_hist[-1].copy(),   # para círculo en visualization.py
     }
+
+    if scene_id is not None:
+        out["scene_id"] = scene_id
+
     if selected_idx is not None:
         out["selected_idx"] = int(selected_idx[b].item())
+
     return out
 
 
@@ -486,7 +583,8 @@ def evaluate_model_standard(
     model, data_loader, device,
     use_planning=False, planner=None,
     save_vis=False, num_vis_samples=10,
-    min_neighbors=0, raw_dataset=None
+    min_neighbors=0, raw_dataset=None,
+    save_attn: bool = False, 
 ):
     model.eval()
 
@@ -502,16 +600,36 @@ def evaluate_model_standard(
         ego = batch[0].to(device)
         neighbors = batch[1].to(device)
         ground_truth = batch[2].to(device)
+        map_segments = None
+        map_mask = None
+        ego_center_batch = None
+        heading_batch = None
+
+        if len(batch) >= 5:
+            map_segments = batch[3].to(device)
+            map_mask = batch[4].to(device)
+
+        if len(batch) >= 7:
+            ego_center_batch = batch[5].to(device)  # (B,2)
+            heading_batch = batch[6].to(device)     # (B,1)
 
         current_state = make_current_state(ego, neighbors)
 
-        model_out = run_batch_standard(model, ego, neighbors)
-        final_plan_traj = model_out["plan_traj"]
-        final_prediction = model_out["prediction"]
+        model_out = run_batch_standard(
+            model=model,
+            ego=ego,
+            neighbors=neighbors,
+            ground_truth=ground_truth,
+            map_segments=map_segments,
+            map_mask=map_mask,
+            return_attn=save_attn,
+            )
+        # Elegir modo final (sin planner): argmax de scores
+        best_mode_idx = torch.argmax(model_out["scores"], dim=1)  # (B,)
 
+        final_plan_traj = model_out["plan_trajs"][torch.arange(ego.shape[0], device=device), best_mode_idx]          # (B,T,3)
+        final_prediction = model_out["predictions_all"][torch.arange(ego.shape[0], device=device), best_mode_idx]    # (B,N,T,3)
         if use_planning and planner is not None:
-            # standard: optimiza 1 vez (best_mode)
-            best_mode_idx = torch.argmax(model_out["scores"], dim=1)
             plan_control_init = model_out["plans"][torch.arange(ego.shape[0], device=device), best_mode_idx]  # (B,T,2)
 
             w = model_out["cost_function_weights"]
@@ -575,6 +693,32 @@ def evaluate_model_standard(
                     topk=3,
                     raw_dataset=raw_dataset
                 )
+                # ---- Adjuntar mapa local ----
+                if map_segments is not None and map_mask is not None:
+                    # ---- Adjuntar mapa local (segmentos) en WORLD ----
+                    if map_segments is not None and map_mask is not None and raw_dataset is not None:
+                        seg_ego = map_segments[bb].detach().cpu().numpy().astype(np.float32)
+
+                        ego_center_world = ego_center_batch[bb].detach().cpu().numpy().astype(np.float32)
+                        heading = float(heading_batch[bb].detach().cpu().item())
+
+                        seg_world = segs_ego_to_world(seg_ego, ego_center_world, heading)
+
+                        sample_multi["map_segments"] = seg_world
+                        sample_multi["map_mask"]     = map_mask[bb].detach().cpu().numpy()
+                    elif map_segments is not None and map_mask is not None:
+                        # fallback: si no hay raw_dataset, dejamos en el frame actual
+                        sample_multi["map_segments"] = map_segments[bb].detach().cpu().numpy()
+                        sample_multi["map_mask"]     = map_mask[bb].detach().cpu().numpy()
+                # ---- Adjuntar atención (solo ego) si existe ----
+                attn_w = model_out.get("attn_w", None)   # esperado: (B, modes, heads, A, M)
+                if attn_w is not None:
+                    aw = attn_w[bb]               # (modes, heads, A, M)
+                    aw = aw.mean(dim=0)           # promedio modos -> (heads, A, M)
+                    aw = aw.mean(dim=0)           # promedio heads -> (A, M)
+                    attn_ego = aw[0]              # ego idx 0 -> (M,)
+                    attn_ego = attn_ego / (attn_ego.max() + 1e-8)
+                    sample_multi["attn_ego"] = attn_ego.detach().cpu().numpy()
                 vis_samples.append(sample_multi)
     return {
         "predictor_type": "standard",
@@ -597,7 +741,8 @@ def evaluate_model_vae(
     vae_prior="fixed",
     vae_num_samples=15,
     vae_select_mode="best_of_k",      # best_of_k | mean_of_k | first
-    vae_vis_mode="final"              # final | multi | both
+    vae_vis_mode="final",
+    save_attn: bool = False,              # final | multi | both
 ):
     """
     Nuevo flujo VAE:
@@ -621,6 +766,19 @@ def evaluate_model_vae(
         neighbors = batch[1].to(device)
         ground_truth = batch[2].to(device)
 
+        map_segments = None
+        map_mask = None
+        ego_center_batch = None
+        heading_batch = None
+
+        if len(batch) >= 5:
+            map_segments = batch[3].to(device)
+            map_mask = batch[4].to(device)
+
+        if len(batch) >= 7:
+            ego_center_batch = batch[5].to(device)  # (B,2)
+            heading_batch = batch[6].to(device)     # (B,1)
+
         current_state = make_current_state(ego, neighbors)
 
         # 1) Genera K muestras
@@ -631,7 +789,10 @@ def evaluate_model_vae(
             ground_truth=ground_truth,
             num_samples=vae_num_samples,
             vae_prior=vae_prior,
-        )
+            map_segments=map_segments,
+            map_mask=map_mask,
+            return_attn=save_attn,
+            )
 
         # 2) Selección antes del planner
         plan_control_init, prediction_init, weights_init, selected_idx, aux_vis = \
@@ -706,6 +867,32 @@ def evaluate_model_vae(
                     sample_final["vae_select_mode"] = vae_select_mode
                     if selected_idx is not None:
                         sample_final["selected_idx"] = int(selected_idx[bb].item())
+                    # ---- Adjuntar mapa local (segmentos) ----
+                    if map_segments is not None and map_mask is not None:
+# ---- Adjuntar mapa local (segmentos) en WORLD ----
+                        if map_segments is not None and map_mask is not None and raw_dataset is not None:
+                            seg_ego = map_segments[bb].detach().cpu().numpy().astype(np.float32)
+
+                            ego_center_world = ego_center_batch[bb].detach().cpu().numpy().astype(np.float32)
+                            heading = float(heading_batch[bb].detach().cpu().item())
+
+                            seg_world = segs_ego_to_world(seg_ego, ego_center_world, heading)
+
+                            sample_final["map_segments"] = seg_world
+                            sample_final["map_mask"]     = map_mask[bb].detach().cpu().numpy()
+                        elif map_segments is not None and map_mask is not None:
+                            sample_final["map_segments"] = map_segments[bb].detach().cpu().numpy()
+                            sample_final["map_mask"]     = map_mask[bb].detach().cpu().numpy()
+                    # ---- Adjuntar atención (solo ego) ----
+                    attn_w = model_out.get("attn_w", None)  # esperado: (B, modes, heads, A, M)
+                    if attn_w is not None:
+                        aw = attn_w[bb]               # (modes, heads, A, M)
+                        aw = aw.mean(dim=0)           # promedio modos -> (heads, A, M)
+                        aw = aw.mean(dim=0)           # promedio heads -> (A, M)
+                        attn_ego = aw[0]              # ego idx 0 -> (M,)
+                        attn_ego = attn_ego / (attn_ego.max() + 1e-8)
+                        sample_final["attn_ego"] = attn_ego.detach().cpu().numpy()
+
                     vis_samples.append(sample_final)
 
                 if vae_vis_mode in ("multi", "both") and len(vis_samples) < num_vis_samples:
@@ -721,6 +908,31 @@ def evaluate_model_vae(
                         raw_dataset=raw_dataset
                     )
                     sample_multi["vae_select_mode"] = vae_select_mode
+
+                    # ---- Adjuntar mapa local (segmentos) ----
+                    if map_segments is not None and map_mask is not None:
+                        if raw_dataset is not None and ego_center_batch is not None and heading_batch is not None:
+                            seg_ego = map_segments[bb].detach().cpu().numpy().astype(np.float32)
+
+                            ego_center_world = ego_center_batch[bb].detach().cpu().numpy().astype(np.float32)
+                            heading = float(heading_batch[bb].detach().cpu().item())
+
+                            seg_world = segs_ego_to_world(seg_ego, ego_center_world, heading)
+
+                            sample_multi["map_segments"] = seg_world
+                            sample_multi["map_mask"] = map_mask[bb].detach().cpu().numpy()
+
+                        else:
+                            sample_multi["map_segments"] = map_segments[bb].detach().cpu().numpy()
+                            sample_multi["map_mask"] = map_mask[bb].detach().cpu().numpy()
+
+                    # ---- Adjuntar atención (solo ego) ----
+                    attn_w = model_out.get("attn_w", None)
+                    if attn_w is not None:
+                        aw = attn_w[bb].mean(dim=0).mean(dim=0)  # (A,M) promedio modos+heads
+                        attn_ego = aw[0]
+                        attn_ego = attn_ego / (attn_ego.max() + 1e-8)
+                        sample_multi["attn_ego"] = attn_ego.detach().cpu().numpy()
                     vis_samples.append(sample_multi)
 
     return {
@@ -754,19 +966,22 @@ def main():
     parser.add_argument("--max_speed", type=float, default=1, help="Velocidad maxima permitida para el ego en m/s")
 
     # VAE
-    parser.add_argument("--vae_num_samples", type=int, default=20,
-                        help="Número de muestras z para PredictorVAE en inferencia")
-    parser.add_argument("--vae_select_mode", type=str, default="best_of_k",
-                        choices=["first", "best_of_k", "mean_of_k"],
-                        help="Cómo seleccionar UNA muestra antes del planner (best_of_k usa GT)")
-    parser.add_argument("--vae_vis_mode", type=str, default="final",
-                        choices=["final", "multi", "both"],
-                        help="Qué guardar/visualizar: final=una escena, multi=K muestras, both=ambas")
-    parser.add_argument("--vae_prior", type=str, default="fixed",
-                    choices=["fixed", "learned"],
-                    help="fixed: z~N(0,I). learned: z~p(z|past) aprendida.")
+    parser.add_argument("--vae_num_samples", type=int, default=5, help="Número de muestras z para PredictorVAE en inferencia")
+    parser.add_argument("--vae_select_mode", type=str, default="best_of_k", choices=["first", "best_of_k", "mean_of_k"], help="tipo de selección")
+    parser.add_argument("--vae_vis_mode", type=str, default="final", choices=["final", "multi", "both"], help="Qué guardar/visualizar: final=una escena, multi=K muestras, both=ambas")
+    parser.add_argument("--vae_prior", type=str, default="fixed", choices=["fixed", "learned"], help="fixed: z~N(0,I). learned: z~p(z|past) aprendida.")
+    
+    # MAP
+    parser.add_argument("--use_map", action="store_true", help="Usar mapa (segmentos locales)")
+    parser.add_argument("--map_root", type=str, default="mapa")
+    parser.add_argument("--map_radius", type=float, default=7.0)
+    parser.add_argument("--map_max_segments", type=int, default=10)
+    parser.add_argument("--map_prefilter_margin", type=float, default=1.0)
 
+    # Interpretation
+    parser.add_argument("--save_attn", action="store_true", help="Guardar/usar pesos de atención agente->segmento (solo ego) para visualización.")
     args = parser.parse_args()
+
 
     log_path = f"./testing_log/{args.name}/"
     os.makedirs(log_path, exist_ok=True)
@@ -795,12 +1010,27 @@ def main():
 
     if args.predictor == "PredictorVAE":
         logging.info(f"VAE prior: {args.vae_prior}")
-        model = PredictorVAE(12).to(args.device)
+        logging.info(f"Use map in model: {args.use_map}")
+
+        model = PredictorVAE(
+            12,
+            use_map=args.use_map,
+            use_prior=(args.vae_prior == "learned")
+        ).to(args.device)
     else:
-        model = Predictor(12).to(args.device)
+        model = Predictor(
+            12,
+            use_map=args.use_map
+        ).to(args.device)
 
     logging.info("Loading model...")
-    model.load_state_dict(torch.load(args.model_path, map_location=args.device))
+    state_dict = torch.load(
+    args.model_path,
+    map_location=args.device,
+    weights_only=True
+)
+
+    model.load_state_dict(state_dict)
     model.eval()
     logging.info("Model loaded successfully!")
 
@@ -812,7 +1042,15 @@ def main():
         logging.info("Planner ready!")
 
     logging.info("Loading test data...")
-    test_set = DrivingData(args.test_set)
+    test_set = DrivingData(
+    args.test_set,
+    ego_frame=True,
+    use_map=args.use_map,
+    map_root=args.map_root,
+    map_radius=args.map_radius,
+    map_max_segments=args.map_max_segments,
+    prefilter_margin=args.map_prefilter_margin,
+    )
     test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
     logging.info(f"Test set: {len(test_set)} samples")
 
@@ -834,7 +1072,8 @@ def main():
             vae_prior=args.vae_prior,
             vae_num_samples=args.vae_num_samples,
             vae_select_mode=args.vae_select_mode,
-            vae_vis_mode=args.vae_vis_mode
+            vae_vis_mode=args.vae_vis_mode,
+            save_attn=args.save_attn,
         )
     else:
         results = evaluate_model_standard(
@@ -846,7 +1085,8 @@ def main():
             save_vis=args.save_vis,
             num_vis_samples=args.num_vis_samples,
             min_neighbors=args.min_neighbors,
-            raw_dataset=test_set
+            raw_dataset=test_set,
+            save_attn=args.save_attn,
         )
 
     logging.info("=" * 60)
@@ -890,8 +1130,10 @@ def main():
         save_visualizations_from_samples(
             samples_data=results["vis_samples"],
             save_path=vis_path,
-            predictor_type=results["predictor_type"]  # aquí "vae" o "standard"
-        )
+            predictor_type=results["predictor_type"],
+            map_root=args.map_root,
+            map_radius=args.map_radius,
+)
         logging.info(f"Visualizations saved to: {vis_path}")
 
 

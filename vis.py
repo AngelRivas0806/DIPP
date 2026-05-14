@@ -49,7 +49,7 @@ def load_obstacles_file(path: str) -> List[np.ndarray]:
 
     def flush():
         nonlocal cur
-        if len(cur) >= 3:
+        if len(cur) >= 2:
             obstacles.append(np.asarray(cur, dtype=np.float32))
         cur = []
 
@@ -190,17 +190,17 @@ def plot_sample(
 
     ax.set_title(title or f"Sample {i}" + (" (ego-frame)" if ego_frame else ""))
 
-    s_pt = 6
-    s_center = 60
-    lw = 1.2
-    alpha_neigh = 0.55
+    s_pt = 25
+    s_center = 130
+    lw = 4.0
+    alpha_neigh = 0.6
 
     # Radio
     radius_m = 7.0
     center_xy = np.array([0.0, 0.0], dtype=np.float32) if ego_frame else ego_obs_xy[c]
     circle = Circle((float(center_xy[0]), float(center_xy[1])),
                     radius=radius_m, edgecolor="yellow", facecolor="yellow",
-                    alpha=0.3, linewidth=1.5, zorder = 1)
+                    alpha=0.25, linewidth=1.5, zorder = 1)
     ax.add_patch(circle)
 
     # Vecinos
@@ -264,7 +264,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--npz", required=True)
     ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--num_save", type=int, default=20, help="Total de imágenes a guardar")
+    ap.add_argument("--num_save", type=int, default=40, help="Total de imágenes a guardar")
     ap.add_argument("--out_dir", type=str, default="vis_out", help="Carpeta destino")
     ap.add_argument("--per_scene", type=int, default=None,
                     help="Cuántas por escena. Si no lo pones, se reparte automáticamente.")

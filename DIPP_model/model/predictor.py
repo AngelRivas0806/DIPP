@@ -30,6 +30,17 @@ class AgentEncoder(nn.Module):
         output   = traj[:, -1]
         return output
 
+class MapEncoder(nn.Module):
+    def __init__(self, embed_dim):
+        super(MapEncoder, self).__init__()
+        self.embed_dim = embed_dim
+        self.embedding = nn.Linear(4, self.embed_dim)
+
+    def forward(self, inputs):
+        # Apply GELU activation to the embedded features
+        embedded = nn.GELU()(self.embedding(inputs))
+        return embedded
+
 """Multi-modal transformer module is used for agent2map, so we commented that code , we modified agent2agent to use it as well"""
 class MultiModalTransformer(nn.Module):
     def __init__(self, modes, tokens_dim=256, output_dim=256):
@@ -38,15 +49,42 @@ class MultiModalTransformer(nn.Module):
         self.attention = nn.ModuleList([nn.MultiheadAttention(tokens_dim, 4, 0.1, batch_first=True) for _ in range(modes)])
         self.ffn = nn.Sequential(nn.LayerNorm(tokens_dim), nn.Linear(tokens_dim, 1024), nn.ReLU(), nn.Dropout(0.1), nn.Linear(1024, output_dim), nn.LayerNorm(output_dim))
 
-    def forward(self, query, key, value, mask=None):
+    def forward(self, query, key, value, mask=None, return_attn: bool = False):
         attention_output = []
+        attn_weights_all = []  # (por modo) cada uno será (B, heads, A, M)
+
         for i in range(self.modes):
-            attention_output.append(self.attention[i](query, key, value, key_padding_mask=mask)[0])
-        attention_output = torch.stack(attention_output, dim=1)
+            out_i, w_i = self.attention[i](
+                query, key, value,
+                key_padding_mask=mask,
+                need_weights=return_attn,
+                average_attn_weights=False
+            )
+            attention_output.append(out_i)
+            if return_attn:
+                attn_weights_all.append(w_i)
+
+        attention_output = torch.stack(attention_output, dim=1)  # (B, modes, A, E)
         output = self.ffn(attention_output)
 
-        return output
+        if return_attn:
+            attn_weights = torch.stack(attn_weights_all, dim=1)  # (B, modes, heads, A, M)
+            return output, attn_weights
+        else:
+            return output
 
+class Agent2Map(nn.Module):
+    def __init__(self, modes: int, tokens_dim: int):
+        super().__init__()
+        self.modes = modes
+        self.map_attn = MultiModalTransformer(modes=modes, tokens_dim=tokens_dim, output_dim=tokens_dim)
+
+    def forward(self, agent_tokens, map_tokens, map_padding_mask=None, return_attn: bool = False):
+        return self.map_attn(
+            agent_tokens, map_tokens, map_tokens,
+            mask=map_padding_mask,
+            return_attn=return_attn
+    )
 """
 Agent2Agent uses multimodal transformer to predict multiple future for each scene.
 """
@@ -68,7 +106,6 @@ class Agent2Agent(nn.Module):
         # (B, M, A, E)
         # output = encoded.unsqueeze(1).expand(-1, self.modes, -1, -1).clone()
 
-        # ruido distinto por modo para romper el colapso
         query = encoded  # (batch, num_agents, 256)
         output = self.multimodal(query, encoded, encoded, mask)
 
@@ -195,8 +232,10 @@ class Score(nn.Module):
 
 class Predictor(nn.Module):
     # Constructor
-    def __init__(self, future_steps, embed_dim=256, num_neighbors=10, num_modes=NUM_MODES, predict_positions=False):
+    def __init__(self, future_steps, embed_dim=256, num_neighbors=10, num_modes=NUM_MODES, predict_positions=False, use_map : bool = False):
         super(Predictor, self).__init__()
+
+        self.use_map = use_map  
         self._future_steps  = future_steps
         self._num_neighbors = num_neighbors
         self._num_modes     = num_modes
@@ -204,10 +243,13 @@ class Predictor(nn.Module):
         self.pedestrian_net = AgentEncoder(embed_dim=self.embed_dim)    # Encoding the history of each agent: ego and neighbors (embed_dim)
         self.agent_agent_net= Agent2Agent(modes=num_modes, tokens_dim=embed_dim) # Inter agent attention module
         self.plan_net       = PlanDecoder(future_steps=self._future_steps, token_dims=embed_dim, num_modes=num_modes) # Plan decoder
+        if self.use_map:
+            self.map_encoder = MapEncoder(embed_dim=self.embed_dim)  # espera 8 dims
+            self.agent_map_net = Agent2Map(modes=num_modes, tokens_dim=embed_dim)
         self.predict        = AgentDecoder(future_steps=self._future_steps, token_dims=embed_dim, num_neighbors=num_neighbors, num_modes=num_modes, predict_positions=predict_positions) # Agent decoder
         self.score          = Score(num_modes=num_modes, tokens_dim=embed_dim) # Score estimation
 
-    def forward(self, ego, neighbors):
+    def forward(self, ego, neighbors, map_segments=None, map_mask=None, return_attn: bool = False):
         """
         ego:       (B, T_obs, feat_dim)          
         neighbors: (B, num_neighbors, T_obs, feat_dim)
@@ -228,11 +270,49 @@ class Predictor(nn.Module):
         neighbor_mask = (neighbor_last[:, :, 6] == 0)      # (B, N)  True = ausente (flag==0)
         actor_mask = torch.cat([ego_mask, neighbor_mask], dim=1)  # (B, 1+N)
         agent_agent = self.agent_agent_net(actors, actor_mask)
+        
+
+        attn_w = None  # por si no usamos mapa o no pedimos attn
+
+        if self.use_map and (map_segments is not None) and (map_mask is not None) and map_mask.any():
+
+            # (B, M, 4) = [x1, y1, x2, y2]
+            map_feats = map_segments.clone()
+            map_valid = map_mask.bool().clone()
+
+
+            # Previene NaN en MultiheadAttention por los padding
+            empty = ~map_valid.any(dim=1)  # (B,)
+
+            if empty.any():
+                map_valid[empty, 0] = True
+                map_feats[empty, 0, :] = 0.0
+
+            map_tokens = self.map_encoder(map_feats)  # (B, M, 256)
+
+            # PyTorch key_padding_mask: True = PAD
+            map_key_padding_mask = ~map_valid  # (B, M)
+
+            if return_attn:
+                agent_map, attn_w = self.agent_map_net(
+                    actors,
+                    map_tokens,
+                    map_key_padding_mask,
+                    return_attn=True
+                )
+            else:
+                agent_map = self.agent_map_net(
+                    actors,
+                    map_tokens,
+                    map_key_padding_mask
+                )
+
+            # Fusion residual
+            agent_agent = agent_agent + agent_map
+
         ego_modes = agent_agent[:, :, 0, :]  
         plans, cost_function_weights = self.plan_net(ego_modes)
         current_state_neighbors = neighbors[:, :, -1, :]
-
-
         # agent_agent[:, :, 1:] → (B, num_modes, num_neighbors, 256)
         predictions = self.predict(       agent_agent[:, :, 1:],      # embeddings por modo de vecinos
             current_state_neighbors     # estado actual de vecinos
@@ -240,6 +320,8 @@ class Predictor(nn.Module):
         # predictions: (B, num_modes, num_neighbors, future_steps, 3)
         scores = self.score(agent_agent)  # (B, num_modes) = (B, 3)
 
+        if return_attn:
+            return plans, predictions, scores, cost_function_weights, attn_w
         return plans, predictions, scores, cost_function_weights
 
 

@@ -117,8 +117,9 @@ class EgoDecoderVAE(nn.Module):
         return actions, cost_function_weights
 
 class PredictorVAE(nn.Module):
-    def __init__(self, future_steps, embed_dim=256, num_neighbors=10, num_modes=1, predict_positions=False, use_prior = bool):
+    def __init__(self, future_steps, embed_dim=256, num_neighbors=10, num_modes=1, predict_positions=False, use_prior: bool = False, use_map : bool = False):
         super(PredictorVAE, self).__init__()
+        self.use_map = use_map
         self._future_steps  = future_steps
         self._num_neighbors = num_neighbors 
         self.embed_dim      = embed_dim
@@ -126,12 +127,15 @@ class PredictorVAE(nn.Module):
         self.agent_agent_net= Agent2AgentVAE(modes=num_modes, tokens_dim=embed_dim) # Inter agent attention module
         self.ego_decoder = EgoDecoderVAE(future_steps=self._future_steps, token_dims=288)
         self.neighbor_decoder = DecoderVAE(future_steps=self._future_steps, token_dims=288, num_neighbors=num_neighbors, predict_positions=predict_positions)
+        if self.use_map:
+            self.map_encoder = MapEncoder(embed_dim=self.embed_dim)
+            self.agent_map_net = Agent2Map(modes=num_modes, tokens_dim=self.embed_dim)
         self.priori_distribution = mlp_gaussian(input_dim=embed_dim, hidden_dim=256, output_dim=64)  # (B, 64) -> (B, 32) for mu and (B, 32) for logvar
         self.posterior_distribution = mlp_gaussian(input_dim=embed_dim*2, hidden_dim=256, output_dim=64)  # (B, 64) -> (B, 32) for mu and (B, 32) for logvar
         self.reparametrization_train = reparametrization()
         self.use_prior = use_prior
 
-    def forward(self, ego, neighbors, ground_truth):
+    def forward(self, ego, neighbors, ground_truth, map_segments=None, map_mask=None, return_attn: bool = False):
         """
         ego:       (B, T_obs, feat_dim)          
         neighbors: (B, num_neighbors, T_obs, feat_dim)
@@ -166,10 +170,39 @@ class PredictorVAE(nn.Module):
 
         agent_agent = self.agent_agent_net(actors_history, actor_mask)
 
+        attn_w = None
+
+        if self.use_map and (map_segments is not None) and (map_mask is not None) and map_mask.any():
+            # (B, M, 4) = [x1, y1, x2, y2]
+            # map_segments: (B, M, 4) = [x1, y1, x2, y2]
+            map_feats = map_segments.clone()
+            map_valid = map_mask.bool().clone()
+
+            # Caso peligroso:
+            # alguna muestra del batch no tiene ningún segmento válido
+            empty = ~map_valid.any(dim=1)  # (B,)
+
+            if empty.any():
+                # Creamos un segmento dummy [0,0,0,0]
+                # para que MultiheadAttention no reciba "todo padding"
+                map_valid[empty, 0] = True
+                map_feats[empty, 0, :] = 0.0
+
+            map_tokens = self.map_encoder(map_feats)  # (B, M, 256)
+
+            # True = padding
+            map_key_padding_mask = ~map_valid  # (B, M)
+
+            agent_map = self.agent_map_net(
+                actors_history,
+                map_tokens,
+                map_key_padding_mask
+            )
+
+            agent_agent = agent_agent + agent_map
+
         future_actor_mask = actor_mask  # (B, 1+N)
         agent_agent_future = self.agent_agent_net(actors_future, future_actor_mask)
-        # print(agent_agent.shape)
-        # print(agent_agent_future.shape)
         agent_agent_gap = GAP(agent_agent)  # (B, 1, 256)
         agent_agent_future_gap = GAP(agent_agent_future)  # (B, 1, 256)
 
@@ -213,59 +246,91 @@ class PredictorVAE(nn.Module):
         predictions = self.neighbor_decoder(neighbor_conditioned, current_state_neighbors)  # (B,N,T,2)
         predictions = predictions.unsqueeze(1)  # (B,1,N,T,2)
 
+        if return_attn:
+            return plans, predictions, cost_function_weights, posterior_mu, posterior_logvar, priori_mu, priori_logvar, attn_w
         return plans, predictions, cost_function_weights, posterior_mu, posterior_logvar, priori_mu, priori_logvar
 
-    def inference(self, ego, neighbors, z=None, num_samples=1):
+    def inference(self, ego, neighbors, map_segments=None, map_mask=None, z=None, num_samples=1, prior="fixed", return_attn: bool = False):
 
         device = ego.device
         B = ego.shape[0]
         N = self._num_neighbors
         latent_dim = 32  
 
-        # =====================================================
-        # 1) Encode history
-        # =====================================================
         ego_embed_history = self.pedestrian_net(ego)  # (B, 256)
 
         neighbor_embeds_history = torch.stack([self.pedestrian_net(neighbors[:, i]) for i in range(N)], dim=1)  # (B, N, 256)
 
         actors_history = torch.cat([ego_embed_history.unsqueeze(1), neighbor_embeds_history],  dim=1)  # (B, 1+N, 256)
 
-        # =====================================================
-        # 2) Build mask exactly as in training
-        # =====================================================
         ego_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)   # (B,1)
         neighbor_last = neighbors[:, :, -1, :]                          # (B,N,feat_dim)
         neighbor_mask = (neighbor_last[:, :, 6] == 0)                   # (B,N)
         actor_mask = torch.cat([ego_mask, neighbor_mask], dim=1)        # (B,1+N)
 
         # =====================================================
-        # 3) Agent-agent interaction over history only
+        #  Agent-agent interaction over history only
         # =====================================================
         agent_agent = self.agent_agent_net(actors_history, actor_mask)
-        # esperado: (B, 1, 1+N, 256) o compatible con lo que usas luego
 
-        agent_agent_gap = GAP(agent_agent)   # (B, 1, 256)
+        # -------------------------
+        # Agent -> Map cross-attn
+        # -------------------------
+        attn_w = None
+
+        if self.use_map and (map_segments is not None) and (map_mask is not None) and map_mask.any():
+
+            # map_segments: (B, M, 4) = [x1, y1, x2, y2]
+            map_feats = map_segments.clone()
+            map_valid = map_mask.bool().clone()
+
+            # Evitar muestras con todos los segmentos como padding
+            empty = ~map_valid.any(dim=1)  # (B,)
+
+            if empty.any():
+                map_valid[empty, 0] = True
+                map_feats[empty, 0, :] = 0.0
+
+            map_tokens = self.map_encoder(map_feats)  # (B, M, 256)
+
+            # True = padding
+            map_key_padding_mask = ~map_valid
+
+            if return_attn:
+                agent_map, attn_w = self.agent_map_net(actors_history, map_tokens, map_key_padding_mask, return_attn=True)
+            else:
+                agent_map = self.agent_map_net(actors_history, map_tokens, map_key_padding_mask)
+
+            agent_agent = agent_agent + agent_map
+
+            agent_agent_gap = GAP(agent_agent)   # (B, 1, 256)
 
         # =====================================================
-        # 4) Sample z from prior N(0, I)
+        #  prior (fixed or learned)
         # =====================================================
         if z is None:
-            z = torch.randn(B, num_samples, latent_dim, device=device)
+            if prior == "learned" and self.use_prior:
+                priori = self.priori_distribution(agent_agent_gap)  # (B,1,64)
+                mu_p, logvar_p = priori.chunk(2, dim=-1)            # (B,1,32)
+                mu_p = mu_p.squeeze(1)                              # (B,32)
+                logvar_p = logvar_p.squeeze(1)                      # (B,32)
+                std = torch.exp(0.5 * logvar_p)
+
+                eps = torch.randn(B, num_samples, latent_dim, device=device)
+                z = mu_p[:, None, :] + eps * std[:, None, :]        # (B,num_samples,32)
+            else:
+                z = torch.randn(B, num_samples, latent_dim, device=device)
         else:
-            # Aceptamos z con forma (B, latent_dim) y la convertimos a (B,1,latent_dim)
             if z.dim() == 2:
                 z = z.unsqueeze(1)
-
             if z.shape[0] != B:
                 raise ValueError(f"z batch mismatch: expected {B}, got {z.shape[0]}")
             if z.shape[-1] != latent_dim:
                 raise ValueError(f"z latent_dim mismatch: expected {latent_dim}, got {z.shape[-1]}")
-
             num_samples = z.shape[1]
 
         # =====================================================
-        # 5) Concatenate z with encoded history for ego
+        # Concatenate z with encoded history for ego
         # =====================================================
         agent_agent_gap_expanded = agent_agent_gap.expand(-1, num_samples, -1)  # (B, num_samples, 256)
 
@@ -275,7 +340,7 @@ class PredictorVAE(nn.Module):
         )  # (B, num_samples, 288)
 
         # =====================================================
-        # 6) Decode ego plan for each sample
+        #  Decode ego plan for each sample
         # =====================================================
         plans_list = []
         weights_list = []
@@ -284,15 +349,15 @@ class PredictorVAE(nn.Module):
             cond_k = conditionated_encoded[:, k, :]              # (B, 288)
             plan_k, w_k = self.ego_decoder(cond_k)               # plan_k: (B, T, 2)
             plans_list.append(plan_k.unsqueeze(1))               # (B,1,T,2)
-            weights_list.append(w_k.unsqueeze(1))                # (B,1,...) depende de decoder
+            weights_list.append(w_k.unsqueeze(1))                # (B,1,...) 
 
         plans = torch.cat(plans_list, dim=1)                     # (B, num_samples, T, 2)
         cost_function_weights = torch.cat(weights_list, dim=1)   # (B, num_samples, ...)
 
         # =====================================================
-        # 7) Prepare neighbor tokens
+        #  Prepare neighbor tokens
         # =====================================================
-        neighbor_tokens = agent_agent[:, :, 1:, :]   # según tu forward actual
+        neighbor_tokens = agent_agent[:, :, 1:, :]   
         # esperado: (B,1,N,256)
 
         if neighbor_tokens.shape[1] == 1 and num_samples > 1:
@@ -300,15 +365,12 @@ class PredictorVAE(nn.Module):
 
         z_neighbors = z.unsqueeze(2).expand(-1, -1, N, -1)  # (B,num_samples,N,32)
 
-        neighbor_conditioned = torch.cat(
-            [neighbor_tokens, z_neighbors],
-            dim=-1
-        )  # (B,num_samples,N,288)
+        neighbor_conditioned = torch.cat([neighbor_tokens, z_neighbors], dim=-1)  # (B,num_samples,N,288)
 
         current_state_neighbors = neighbors[:, :, -1, :]  # (B,N,feat_dim)
 
         # =====================================================
-        # 8) Decode neighbor futures for each sample
+        #  Decode neighbor futures for each sample
         # =====================================================
         pred_list = []
         for k in range(num_samples):
@@ -318,6 +380,8 @@ class PredictorVAE(nn.Module):
 
         predictions = torch.cat(pred_list, dim=1)  # (B,num_samples,N,T,2)
 
+        if return_attn:
+            return plans, predictions, cost_function_weights, z, attn_w
         return plans, predictions, cost_function_weights, z
 
 if __name__ == "__main__":

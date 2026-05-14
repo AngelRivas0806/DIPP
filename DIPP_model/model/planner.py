@@ -2,16 +2,17 @@ import torch
 import theseus as th
 from utils.train_utils import bicycle_model  
 
-# =========================
+# ================================
 # u: (B, 2T) -> control: (B, T, 2)
-# =========================
+# ================================
 def _reshape_control(u: torch.Tensor):
     T = u.shape[-1] // 2
     return u.view(-1, T, 2), T
 
 # =========================
-# Residual functions
+""" Residual functions"""
 # =========================
+
 def speed_limit_residual(optim_vars, aux_vars):
     u = optim_vars[0].tensor
     control, T = _reshape_control(u)
@@ -231,11 +232,19 @@ class MotionPlanner:
                 objective, th.CholeskyDenseSolver,
                 vectorize=False, max_iterations=3, step_size=0.3, abs_err_tolerance=1e-2
             )
+        # else:
+        #     self.optimizer = th.GaussNewton(
+        #         objective, th.LUDenseSolver,
+        #         vectorize=False, max_iterations=10, step_size=0.3
+        #     )
         else:
             self.optimizer = th.GaussNewton(
-                objective, th.LUDenseSolver,
-                vectorize=False, max_iterations=10, step_size=0.3
-            )
-
+                objective,
+                th.CholeskyDenseSolver,
+                vectorize=False,
+                max_iterations=5,
+                step_size=0.15,
+                abs_err_tolerance=1e-3,
+         )
         self.layer = th.TheseusLayer(self.optimizer, vectorize=False)
         self.layer.to(self.device)  

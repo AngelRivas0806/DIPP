@@ -8,16 +8,13 @@ import os
 import numpy as np
 import subprocess
 import wandb
-
 from torch import nn, optim
 import torch.nn.functional as F  
 from torch.utils.data import DataLoader
-
 from utils.train_utils import *
 from model.planner import MotionPlanner
 from model.predictor import Predictor
 from model.predictorvae import PredictorVAE
-
 
 # =========================
 """Train a single epoch"""
@@ -34,10 +31,22 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
     predictor.train()
 
     for batch_idx, batch in enumerate(data_loader):
-        # Prepare data
         ego          = batch[0].to(args.device)
         neighbors    = batch[1].to(args.device)
         ground_truth = batch[2].to(args.device)
+        map_segments = None
+        map_mask     = None
+        if len(batch) >= 5:
+            map_segments = batch[3].to(args.device)  # (B,M,4)
+            map_mask     = batch[4].to(args.device)  # (B,M)
+
+        # if map_mask is not None:
+        #     valid_counts = map_mask.bool().sum(dim=1)
+
+        #     if batch_idx < 5:
+        #         print("map valid counts:", valid_counts.detach().cpu().numpy())
+        #         print("min valid:", int(valid_counts.min().item()))
+        #         print("num empty:", int((valid_counts == 0).sum().item()))
 
         # current_state: (B, 11, feat) with the last observed state of ego and neighbors
         current_state = torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
@@ -54,6 +63,30 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
             print(f"ego device: {ego.device}")
         # ========================================================
 
+        # --- DEBUG: imprime segmentos de la primera muestra del batch ---
+        # if batch_idx == 0 and map_segments is not None:
+
+        #     for i in range(10):
+        #         mask0 = map_mask[i].bool()  # (M,)
+        #         segs0 = map_segments[i][mask0]  # (n_valid,4)
+
+        #         print("\n=== FIRST SAMPLE MAP SEGMENTS (ego-frame, clipped) ===")
+        #         print("num_valid:", int(mask0.sum().item()))
+        #         if segs0.numel() == 0:
+        #             print("No valid segments in sample 0.")
+        #         else:
+        #             # imprime hasta 8 segmentos para no saturar
+        #             n_show = min(8, segs0.shape[0])
+        #             print(segs0[:n_show].detach().cpu().numpy())
+
+        #             # extra: longitudes de esos segmentos
+        #             a = segs0[:n_show, 0:2]
+        #             b = segs0[:n_show, 2:4]
+        #             lens = torch.norm(b - a, dim=1)
+        #             print("lengths:", lens.detach().cpu().numpy())
+        #             print("map_segments shape:", map_segments.shape)   # (B, M, 4)
+        #             print("map_mask sum sample0:", int(map_mask[0].bool().sum().item()))  # n_valid
+        #             print("map_max_segments (M):", map_segments.shape[1])
         # predict
         optimizer.zero_grad()
 
@@ -66,18 +99,30 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
         # ================
 
         if args.predictor == "PredictorVAE":
-
-            plans, predictions, cost_function_weights, mu, logvar, priori_mu, priori_logvar = predictor(ego, neighbors, ground_truth)
-
-            plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :2] for i in range(1)], dim = 1) # ---> [B,1,future_time_steps, 2]
-
-            if args.use_prior:
-                _, pred_loss, kl_loss = VAE_loss(plan_trajs, predictions, ground_truth, weights, mu, logvar, ego_in_pred_loss=not use_planning, beta=1.0, prior_mu=priori_mu, prior_logvar=priori_logvar)
-            else:
-                _, pred_loss, kl_loss = VAE_loss(plan_trajs, predictions, ground_truth, weights, mu, logvar, ego_in_pred_loss=not use_planning, beta=1.0)
-
-            best_plan = plan_trajs.squeeze(1)
             
+        # ===================
+            """if use_map"""
+        # ===================
+            if map_segments is None:
+                plans, predictions, cost_function_weights, mu, logvar, priori_mu, priori_logvar = predictor(
+                    ego, neighbors, ground_truth)
+            else:
+                plans, predictions, cost_function_weights, mu, logvar, priori_mu, priori_logvar = predictor(
+                    ego, neighbors, ground_truth, map_segments, map_mask)
+
+            plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :2] for i in range(1)],dim=1)  # (B,1,T,2)
+
+            # ================================
+            """learning prior - use_prior """
+            # ================================
+            if args.use_prior:
+                _, pred_loss, kl_loss = VAE_loss(plan_trajs, predictions, ground_truth, weights, mu, logvar,
+                    ego_in_pred_loss=not use_planning, beta=1.0,
+                    prior_mu=priori_mu, prior_logvar=priori_logvar)
+            else:
+                _, pred_loss, kl_loss = VAE_loss(plan_trajs, predictions, ground_truth, weights, mu, logvar,
+                    ego_in_pred_loss=not use_planning, beta=1.0)
+
             base_loss = (args.lambda_pred * pred_loss + args.lambda_score * kl_loss)
 
             # ======================================================================
@@ -90,16 +135,23 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
                 print(f"{'='*50}\n")
             # =======================================================================
 
-            # ==================
+            # ====================
             """With Planning"""
-            # ==================
+            # ====================
 
             if use_planning:
 
-                prediction = predictions[:, 0]  # (B, N, T, 2)
-                plan = plans[:, 0]        # (B, T, 9) con controles del modo 0, que es el único modo en PredictorVAE
+                plan = plans[:, 0]  # (B, T, 2)     # (B, T, 9) con controles del modo 0, que es el único modo en PredictorVAE
+                prediction = predictions[:, 0] 
 
-                w = cost_function_weights  # (B, 5)
+                w = torch.nan_to_num(
+                cost_function_weights,
+                nan=1.0,
+                posinf=20.0,
+                neginf=1e-2,
+                )
+
+                w = torch.clamp(w, min=1e-2, max=20.0)
 
                 planner_inputs = {
                     "control_variables": plan.view(ego.shape[0], 24),
@@ -111,7 +163,7 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
                     "w_steer":        w[:, 2].unsqueeze(1),
                     "w_steer_change": w[:, 3].unsqueeze(1),
                     "w_collision":    w[:, 4].unsqueeze(1),
-                    "w_speed_limit": w[:, 5].unsqueeze(1),
+                    "w_speed_limit":  w[:, 5].unsqueeze(1),
                 }
 
                 final_values, info = planner.layer.forward(planner_inputs)
@@ -139,20 +191,20 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
                 speed_violation = torch.clamp(speed - args.max_speed, min=0.0)
                 speed_reg = speed_violation.pow(2).mean()
 
-                cost_reg = (
-                    w_acc * acc.pow(2).mean()
-                    + w_jerk * jerk.pow(2).mean()
-                    + w_steer * steer.pow(2).mean()
-                    + w_steer_change * ds.pow(2).mean()
-                    + w_speed * speed_reg
-)
+#                 cost_reg = (
+#                     w_acc * acc.pow(2).mean()
+#                     + w_jerk * jerk.pow(2).mean()
+#                     + w_steer * steer.pow(2).mean()
+#                     + w_steer_change * ds.pow(2).mean()
+#                     + w_speed * speed_reg
+# )
 
                 # imitacion sobre plan optimizado — suma
                 imitation_loss = F.smooth_l1_loss(plan[:, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
 
                 plan_cost = info.last_err.mean() if hasattr(info, "last_err") else 0
 
-                loss = (base_loss + args.lambda_imitation * imitation_loss + args.lambda_cost * (cost_reg + w_col * plan_cost))
+                loss = (base_loss + args.lambda_imitation * imitation_loss + args.lambda_cost * plan_cost)
 
                 # ====================
                 """Without Planning"""
@@ -167,33 +219,33 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
                 imitation_loss = F.smooth_l1_loss(plan[:, :, :2], ground_truth[:, 0, :, :2],  reduction='sum')
 
                 loss = (base_loss + args.lambda_imitation * imitation_loss)
+
             # ==================
-            """Predictor"""
+            """Predictor DIPP"""
             # ==================
         else:
+        # ===================
+            """if use_map"""
+        # ===================
+            if map_segments is None:
+                plans, predictions, scores, cost_function_weights = predictor(ego, neighbors)
+            else:
+                plans, predictions, scores, cost_function_weights = predictor(ego, neighbors, map_segments, map_mask)
 
-            plans, predictions, scores, cost_function_weights = predictor(ego, neighbors)
-
-            # if batch_idx == 0:
-                # print("\n=== DEBUG train predictor ===")
-                # print("plans abs mean:", plans.abs().mean().item())
-                # print("acc abs mean:", plans[:, :, :, 0].abs().mean().item())
-                # print("steer abs mean:", plans[:, :, :, 1].abs().mean().item())
-                # print("acc min/max:", plans[:, :, :, 0].min().item(), plans[:, :, :, 0].max().item())
-                # print("steer min/max:", plans[:, :, :, 1].min().item(), plans[:, :, :, 1].max().item())
 
             plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :2] for i in range(NUM_MODES)], dim=1)
-            # pérdida multi-futuro multi-agente
+
             # ego_in_pred_loss=False cuando use_planning: el ego se supervisa via imitation_loss sobre plan optimizado
             _, pred_loss, score_loss, best_mode = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights,
                                                             ego_in_pred_loss=not use_planning)
-
+            
             # imitacion: ego del modo ganador vs gt — suma
             best_plan = plan_trajs[torch.arange(plan_trajs.shape[0], device=plan_trajs.device), best_mode]
             imitation_loss = F.smooth_l1_loss(best_plan[:, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
 
             # sin planning: loss base, cost_weights NO se usan aqui
-            loss = args.lambda_pred * pred_loss + args.lambda_score * score_loss + args.lambda_imitation * imitation_loss
+            base_loss = (args.lambda_pred * pred_loss + args.lambda_score * score_loss)
+            # loss = args.lambda_pred * pred_loss + args.lambda_score * score_loss + args.lambda_imitation * imitation_loss
 
             # ======================================================================
             if batch_idx == 0:
@@ -209,15 +261,18 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
             """With Planning"""
             # ==================
             if use_planning:
-                # ============================================
-                # 1. Selección del modo (EN ESPACIO DE CONTROLES)
-                # ============================================
+
                 plan, prediction = select_future(plans, predictions, scores, best_mode)
 
-                w = cost_function_weights  # (B,5)
-                # ============================================
-                # 2. Planning (optimización sobre controles)
-                # ============================================
+                w = torch.nan_to_num(
+                cost_function_weights,
+                nan=1.0,
+                posinf=20.0,
+                neginf=1e-2,
+                )
+
+                w = torch.clamp(w, min=1e-2, max=20.0)
+
                 planner_inputs = {
                     "control_variables": plan.view(ego.shape[0], 24),
                     "predictions": prediction,
@@ -228,8 +283,7 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
                     "w_steer":        w[:, 2].unsqueeze(1),
                     "w_steer_change": w[:, 3].unsqueeze(1),
                     "w_collision":    w[:, 4].unsqueeze(1),
-                    "w_speed_limit": w[:, 5].unsqueeze(1),
-                }
+                    "w_speed_limit":  w[:, 5].unsqueeze(1),}
 
                 final_values, info = planner.layer.forward(planner_inputs)
                 u_opt = final_values["control_variables"].view(-1, 12, 2)
@@ -248,52 +302,47 @@ def train_epoch(data_loader, predictor, planner, optimizer, use_planning):
                 w_speed        = w[:, 5].mean()
 
                 acc    = u_opt[:, :, 0]                            # (B, T)
-                jerk   = torch.diff(acc,   dim=1) / dt            # (B, T-1)
-                steer  = u_opt[:, :, 1]                           # (B, T)
-                ds     = torch.diff(steer, dim=1) / dt            # (B, T-1)
+                jerk   = torch.diff(acc,   dim=1) / dt             # (B, T-1)
+                steer  = u_opt[:, :, 1]                            # (B, T)
+                ds     = torch.diff(steer, dim=1) / dt             # (B, T-1)
 
-                
                 speed_violation = torch.clamp(speed - args.max_speed, min=0.0)
                 speed_reg = speed_violation.pow(2).mean()
 
-                cost_reg = (
-                    w_acc * acc.pow(2).mean()
-                    + w_jerk * jerk.pow(2).mean()
-                    + w_steer * steer.pow(2).mean()
-                    + w_steer_change * ds.pow(2).mean()
-                    + w_speed * speed_reg
-                )
+                # cost_reg = (
+                #     w_acc * acc.pow(2).mean()
+                #     + w_jerk * jerk.pow(2).mean()
+                #     + w_steer * steer.pow(2).mean()
+                #     + w_steer_change * ds.pow(2).mean()
+                #     + w_speed * speed_reg
+                # )
 
-                # ============================================
-                # 6. Imitation loss (sobre trayectoria final)
-                # ============================================
-                imitation_loss = F.smooth_l1_loss(
-                    plan[:, :, :2],
-                    ground_truth[:, 0, :, :2],
-                    reduction='sum'
-                )
+                imitation_loss = F.smooth_l1_loss(plan[:, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
 
-                # ============================================
-                # 7. Costo del planner (Theseus)
-                # ============================================
-                plan_cost = info.last_err.mean() if hasattr(info, "last_err") else 0
+                if hasattr(info, "last_err") and info.last_err is not None:
+                    plan_cost = info.last_err.mean()
+                else:
+                    plan_cost = torch.tensor(0.0, device=ego.device, dtype=plan.dtype)
 
-                # ============================================
-                # 8. Loss final
-                # ============================================
-                loss = (
-                    args.lambda_pred * pred_loss
-                    + args.lambda_score * score_loss
+                # loss = (
+                #     args.lambda_pred * pred_loss
+                #     + args.lambda_score * score_loss
+                #     + args.lambda_imitation * imitation_loss
+                #     + args.lambda_cost * (cost_reg + w_col * plan_cost)
+                # )
+                loss = ( base_loss
                     + args.lambda_imitation * imitation_loss
-                    + args.lambda_cost * (cost_reg + w_col * plan_cost)
+                    + args.lambda_cost * (w_col * plan_cost)
                 )
 
             else:
-                # ==================
+                # ====================
                 """Without Planning"""
-                 # ==================
-                # Use the most likely prediction for metrics (no planner)
+                # ====================
+
                 plan, prediction = select_future(plan_trajs, predictions, scores, best_mode)
+
+                loss = (base_loss + args.lambda_imitation * imitation_loss)
 
         # Backpropagation
         loss.backward()
@@ -339,6 +388,11 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
         ego = batch[0].to(args.device)
         neighbors = batch[1].to(args.device)
         ground_truth = batch[2].to(args.device)
+        map_segments = None
+        map_mask     = None
+        if len(batch) >= 5:
+            map_segments = batch[3].to(args.device)  # (B,M,4)
+            map_mask     = batch[4].to(args.device)  # (B,M)
 
         current_state = torch.cat([ego.unsqueeze(1), neighbors[..., :-1]], dim=1)[:, :, -1]
         weights = torch.ne(ground_truth[:, 1:, :, :2], 0)
@@ -351,7 +405,14 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
              ============================= """ 
 
              if args.predictor == "PredictorVAE":
-                plans, predictions, cost_function_weights, mu, logvar, priori_mu, priori_logvar = predictor(ego, neighbors, ground_truth)
+                if map_segments is None:
+                    plans, predictions, cost_function_weights, mu, logvar, priori_mu, priori_logvar = predictor(
+                        ego, neighbors, ground_truth
+                    )
+                else:
+                    plans, predictions, cost_function_weights, mu, logvar, priori_mu, priori_logvar = predictor(
+                        ego, neighbors, ground_truth, map_segments, map_mask
+    )
 
                 plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :3] for i in range(1)], dim=1)
                 
@@ -364,22 +425,22 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
 
                 base_loss = (args.lambda_pred * pred_loss + args.lambda_score * kl_loss)
             
-                # imitation_loss = F.smooth_l1_loss(best_plan[:, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
-
-                # loss = args.lambda_pred * pred_loss + args.lambda_score * kl_loss + args.lambda_imitation * imitation_loss
-
-
                 """ =========================
                       WITH PLANNING
                 ============================= """ 
                 if use_planning:
 
-                    plan = plans[:,:2]
-                    plan = plan.squeeze(1)
-                    
-                    prediction = predictions[:,0] 
+                    plan = plans[:, 0]  # (B, T, 2)
+                    prediction = predictions[:, 0]
 
-                    w = cost_function_weights  # (B, 5)
+                    w = torch.nan_to_num(
+                        cost_function_weights,
+                        nan=1.0,
+                        posinf=20.0,
+                        neginf=1e-2,
+                    )
+
+                    w = torch.clamp(w, min=1e-2, max=20.0)
 
                     planner_inputs = {
                         "control_variables": plan.view(ego.shape[0], 24),
@@ -391,7 +452,7 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
                         "w_steer":        w[:, 2].unsqueeze(1),
                         "w_steer_change": w[:, 3].unsqueeze(1),
                         "w_collision":    w[:, 4].unsqueeze(1),
-                        "w_speed_limit": w[:, 5].unsqueeze(1),
+                        "w_speed_limit":  w[:, 5].unsqueeze(1),
                     }
 
                     final_values, info = planner.layer.forward(planner_inputs)
@@ -419,21 +480,25 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
                     speed_violation = torch.clamp(speed - args.max_speed, min=0.0)
                     speed_reg = speed_violation.pow(2).mean()
 
-                    cost_reg = (
-                        w_acc * acc.pow(2).mean()
-                        + w_jerk * jerk.pow(2).mean()
-                        + w_steer * steer.pow(2).mean()
-                        + w_steer_change * ds.pow(2).mean()
-                        + w_speed * speed_reg
-                    )
+                    # cost_reg = (
+                    #     w_acc * acc.pow(2).mean()
+                    #     + w_jerk * jerk.pow(2).mean()
+                    #     + w_steer * steer.pow(2).mean()
+                    #     + w_steer_change * ds.pow(2).mean()
+                    #     + w_speed * speed_reg
+                    # )
 
+                    if hasattr(info, "last_err") and info.last_err is not None:
+                        plan_cost = info.last_err.mean()
+                    else:
+                        plan_cost = torch.tensor(0.0, device=ego.device, dtype=plan.dtype)
 
-
-                    plan_cost      = info.last_err.mean() if hasattr(info, "last_err") else 0
-                    # imitacion sobre plan optimizado — suma
                     imitation_loss = F.smooth_l1_loss(plan[:, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
 
-                    loss = (base_loss + args.lambda_imitation * imitation_loss + args.lambda_cost * (cost_reg + w_col * plan_cost))
+                    # loss = (base_loss + args.lambda_imitation * imitation_loss + args.lambda_cost * (cost_reg + w_col * plan_cost))
+
+                    loss = (base_loss + args.lambda_imitation * imitation_loss + args.lambda_cost * plan_cost)
+                
                 else:
                     """ =========================
                             WITHOUT PLANNING
@@ -450,7 +515,11 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
                     PREDICTOR VALIDATION
                 ============================= """ 
 
-                plans, predictions, scores, cost_function_weights = predictor(ego, neighbors)
+                if args.use_map:
+                
+                    plans, predictions, scores, cost_function_weights = predictor(ego, neighbors, map_segments=map_segments, map_mask=map_mask)
+                else:
+                    plans, predictions, scores, cost_function_weights = predictor(ego, neighbors)
 
                 plan_trajs = torch.stack([bicycle_model(plans[:, i], ego[:, -1])[:, :, :2] for i in range(NUM_MODES)], dim=1)
 
@@ -458,9 +527,7 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
                 _, pred_loss, score_loss, best_mode = MFMA_loss(plan_trajs, predictions, scores, ground_truth, weights, ego_in_pred_loss=not use_planning)
 
                 best_plan = plan_trajs[torch.arange(plan_trajs.shape[0], device=plan_trajs.device), best_mode]
-                # imitation_loss = F.smooth_l1_loss(best_plan[:, :, :2], ground_truth[:, 0, :, :2], reduction='sum')
-    
-                # loss = args.lambda_pred * pred_loss + args.lambda_score * score_loss + args.lambda_imitation * imitation_loss
+
                 base_loss = (args.lambda_pred * pred_loss + args.lambda_score * score_loss)
                 
                 """ =========================
@@ -470,7 +537,15 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
                        # selecciona el modo ganador para iniciar el optimizador
                     plan, prediction = select_future(plans, predictions, scores, best_mode)
 
-                    w = cost_function_weights  # (B, 6)
+                    
+                    w = torch.nan_to_num(
+                    cost_function_weights,
+                    nan=1.0,
+                    posinf=20.0,
+                    neginf=1e-2,
+                    )
+
+                    w = torch.clamp(w, min=1e-2, max=20.0)
 
                     planner_inputs = {
                         "control_variables": plan.view(ego.shape[0], 24),
@@ -482,8 +557,7 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
                         "w_steer":        w[:, 2].unsqueeze(1),
                         "w_steer_change": w[:, 3].unsqueeze(1),
                         "w_collision":    w[:, 4].unsqueeze(1),
-                        "w_speed_limit": w[:, 5].unsqueeze(1),
-                    }
+                        "w_speed_limit":  w[:, 5].unsqueeze(1),}
 
                     final_values, info = planner.layer.forward(planner_inputs)
                     u_opt = final_values["control_variables"].view(-1, 12, 2)
@@ -505,7 +579,6 @@ def valid_epoch(data_loader, predictor, planner, use_planning):
                     jerk   = torch.diff(acc,   dim=1) / dt            # (B, T-1)
                     steer  = u_opt[:, :, 1]                           # (B, T)
                     ds     = torch.diff(steer, dim=1) / dt            # (B, T-1)
-
                     
                     speed_violation = torch.clamp(speed - args.max_speed, min=0.0)
                     speed_reg = speed_violation.pow(2).mean()
@@ -577,9 +650,18 @@ def model_training():
 
     # Predictor o PredictorVAE
     if args.predictor == "PredictorVAE":
-        predictor = PredictorVAE(12, predict_positions=args.predict_positions).to(args.device)
+        predictor = PredictorVAE(
+            12,
+            predict_positions=args.predict_positions,
+            use_prior=args.use_prior,
+            use_map=args.use_map,
+        ).to(args.device)
     else:
-        predictor = Predictor(12, predict_positions=args.predict_positions).to(args.device)
+        predictor = Predictor(
+            12,
+            predict_positions=args.predict_positions,
+            use_map=args.use_map,
+        ).to(args.device)
 
     # planner
     if args.use_planning:
@@ -598,14 +680,34 @@ def model_training():
     batch_size   = args.batch_size
 
     # Dataset loaders
-    train_set = DrivingData(args.train_set)
-    valid_set = DrivingData(args.valid_set)
+    train_set = DrivingData(
+        args.train_set,
+        ego_frame=True,
+        use_map=args.use_map,
+        map_root=args.map_root,
+        map_radius=args.map_radius,
+        map_max_segments=args.map_max_segments,
+        prefilter_margin=args.map_prefilter_margin,
+    )
+
+    valid_set = DrivingData(
+        args.valid_set,
+        ego_frame=True,
+        use_map=args.use_map,
+        map_root=args.map_root,
+        map_radius=args.map_radius,
+        map_max_segments=args.map_max_segments,
+        prefilter_margin=args.map_prefilter_margin,
+)
 
     # DataLoaders
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
     valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
     logging.info("--- Dataset Prepared: {} train data, {} validation data\n".format(len(train_set), len(valid_set)))
+    logging.info(f"--- Use map: {args.use_map}")
+    if args.use_map:
+        logging.info(f"--- map_root: {args.map_root}, R={args.map_radius}, max_segments={args.map_max_segments}")
 
     # train loop
     for epoch in range(train_epochs):
@@ -623,9 +725,6 @@ def model_training():
         scheduler.step()
 
         """wandb"""
-        # if args.predictor == "PredictorVAE":
-        #     wandb.log({"train/reconstruction_loss": train_metrics[4], "val/reconstruction_loss": val_metrics[4]})
-        #     wandb.log({"train/kl_loss": train_metrics[5], "val/kl_loss": val_metrics[5]})
 
         log = {
             "epoch": epoch + 1,
@@ -657,37 +756,35 @@ def model_training():
 
 
         # save model
-        torch.save(
-            predictor.state_dict(),
-            os.path.join(script_dir, f"training_log/{args.name}/model_{epoch+1}_{val_metrics[0]:.4f}.pth")
-        )
+        torch.save(predictor.state_dict(), os.path.join(script_dir, f"training_log/{args.name}/model_{epoch+1}_{val_metrics[0]:.4f}.pth"))
+
         logging.info(f"Model saved in training_log/{args.name}\n")
 
     # plots
-    logging.info("=" * 60)
-    logging.info("Generating training graphs...")
-    logging.info("=" * 60)
+    # logging.info("=" * 60)
+    # logging.info("Generating training graphs...")
+    # logging.info("=" * 60)
 
-    try:
-        log_csv_path = os.path.join(script_dir, f"training_log/{args.name}/train_log.csv")
-        save_dir = os.path.join(script_dir, f"training_log/{args.name}")
-        plot_script = os.path.join(script_dir, "plot_training.py")
-        result = subprocess.run(
-            ["python", plot_script, "--log_path", log_csv_path, "--save_dir", save_dir],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=script_dir,
-        )
-        logging.info(f"Graphs saved in: training_log/{args.name}/")
-        if result.stdout:
-            logging.info(result.stdout)
-    except subprocess.CalledProcessError as e:
-        logging.warning(f"Error al generar gráficas: {e}")
-        if e.stderr:
-            logging.warning(e.stderr)
-    except FileNotFoundError:
-        logging.warning("No se encontró plot_training.py")
+    # try:
+    #     log_csv_path = os.path.join(script_dir, f"training_log/{args.name}/train_log.csv")
+    #     save_dir = os.path.join(script_dir, f"training_log/{args.name}")
+    #     plot_script = os.path.join(script_dir, "plot_training.py")
+    #     result = subprocess.run(
+    #         ["python", plot_script, "--log_path", log_csv_path, "--save_dir", save_dir],
+    #         capture_output=True,
+    #         text=True,
+    #         check=True,
+    #         cwd=script_dir,
+    #     )
+    #     logging.info(f"Graphs saved in: training_log/{args.name}/")
+    #     if result.stdout:
+    #         logging.info(result.stdout)
+    # except subprocess.CalledProcessError as e:
+    #     logging.warning(f"Error al generar gráficas: {e}")
+    #     if e.stderr:
+    #         logging.warning(e.stderr)
+    # except FileNotFoundError:
+    #     logging.warning("No se encontró plot_training.py")
 
     logging.info("=" * 60)
     logging.info("ENTRENAMIENTO COMPLETADO")
@@ -708,13 +805,23 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, help="learning rate (default: 2e-4)", default=2e-4)
     parser.add_argument("--use_planning", action="store_true", help="if use integrated planning module (default: False)", default=False)
     parser.add_argument("--device", type=str, help="run on which device (default: cuda)", default="cuda")
+
+    # Weights 
     parser.add_argument("--lambda_pred",       type=float, default=1,  help="peso perdida de prediccion")
     parser.add_argument("--lambda_score",      type=float, default=0.2,  help="peso perdida de score")
     parser.add_argument("--lambda_imitation",  type=float, default=1,  help="peso perdida de imitacion")
-    parser.add_argument("--max_speed", type=float, default=1, help="velocidad maxima permitida para el ego en m/s")
-    parser.add_argument("--lambda_cost",       type=float, default=1e-2, help="peso del costo Theseus (solo con planning)")
+    parser.add_argument("--lambda_cost",       type=float, default=1e-3, help="peso del costo Theseus (solo con planning)")
+
+    parser.add_argument("--max_speed", type=float, default=1.5, help="velocidad maxima permitida para el ego en m/s")
     parser.add_argument("--predict_positions", action="store_true", help="predecir posiciones (x,y) absolutas en vez de desplazamientos (dx,dy) para vecinos")
     parser.add_argument("--use_prior", action="store_true", help="Aprender distribución prior (default: False)", default=False)
+
+    # MAPS
+    parser.add_argument("--use_map", action="store_true", help="Activar contexto de mapa (segmentos locales).")
+    parser.add_argument("--map_root", type=str, default="mapa", help="Raíz del mapa: mapa/<scene>/obstacles.txt")
+    parser.add_argument("--map_radius", type=float, default=7.0, help="Radio del mapa local alrededor del ego.")
+    parser.add_argument("--map_max_segments", type=int, default=10, help="Máximo # de segmentos locales (padding).")
+    parser.add_argument("--map_prefilter_margin", type=float, default=1.0, help="Margen extra para el prefiltrado (metros).")
     args = parser.parse_args()
 
     if args.device.startswith("cuda") and torch.cuda.is_available():

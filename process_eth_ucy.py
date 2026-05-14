@@ -2,13 +2,11 @@ import os
 import argparse
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
 ETH_UCY_DATASETS = ["eth-hotel", "eth-univ", "ucy-zara01", "ucy-zara02", "ucy-univ"]
-
 
 @dataclass(frozen=True)
 class SeqConfig:
@@ -18,7 +16,7 @@ class SeqConfig:
     frame_step: int = 10     # ETH/UCY sampleado cada 10 frames
     sample_step: int = 20    # stride del centro (en unidades del CSV)
     k_neighbors: int = 10
-    neighbor_radius: float = 3.0  # metros
+    neighbor_radius: float = 7.0  # metros
 
     @property
     def total_len(self) -> int:
@@ -40,7 +38,6 @@ def load_csv(csv_path: str) -> pd.DataFrame:
 
 
 class TrackIndex:
-    """Cache por peatón y por frame para queries rápidas."""
     def __init__(self, df: pd.DataFrame):
         self.ped_tracks: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
         self.frame_index: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
@@ -280,8 +277,7 @@ def main():
     p.add_argument("--frame_step", type=int, default=10)
     p.add_argument("--sample_step", type=int, default=20)
     p.add_argument("--k_neighbors", type=int, default=10)
-    p.add_argument("--neighbor_radius", type=float, default=3.0,
-                   help="Radio (metros) para considerar vecinos alrededor del ego en frame central")
+    p.add_argument("--neighbor_radius", type=float, default=7.0, help="Radio alrededor de ego")
 
     args = p.parse_args()
 

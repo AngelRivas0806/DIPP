@@ -6,6 +6,7 @@ import os
 from torch.utils.data import Dataset
 from torch.nn import functional as F
 from typing import Tuple, Optional
+from utils.map_util import *
 
 # =========================================================
 # Logging + Reproducibility
@@ -32,6 +33,9 @@ def set_seed(CUR_SEED: int):
 # =========================================================
 # Dataset
 # =========================================================
+
+ETH_UCY_DATASETS = ["eth-hotel", "eth-univ", "ucy-zara01", "ucy-zara02", "ucy-univ"]
+
 class DrivingData(Dataset):
     """
     Dataset
@@ -40,15 +44,36 @@ class DrivingData(Dataset):
       - ego:             (N, obs_len, 6)          [x,y,vx,vy,ax,ay]
       - neighbors:       (N, K, obs_len, 7)       [x,y,vx,vy,ax,ay,flag]
       - gt_future_states:(N, K+1, pred_len, F)    F>=2 (idealmente 6)
+      - scene_id:        (N,)   (requerido si use_map=True)
 
     Devuelve:
-      ego, neighbors, gt_future_states como torch.float32 y con marco de referencia del ego
+      - sin mapa: ego, neighbors, gt
+      - con mapa: ego, neighbors, gt, map_segments, map_mask
+
+    map_segments: (M,4) en ego-frame, ya CLIP al círculo de radio map_radius
+    map_mask:     (M,) bool
     """
 
-    def __init__(self, npz_path: str, ego_frame: bool = True):
+    def __init__(
+        self,
+        npz_path: str,
+        ego_frame: bool = True,
+        # ---- mapa (opcional) ----
+        use_map: bool = False,
+        map_root: str = "mapa",
+        map_radius: float = 7.0,
+        map_max_segments: int = 128,
+        prefilter_margin: float = 1.0,
+    ):
         assert npz_path.endswith(".npz") and os.path.isfile(npz_path), f"Archivo inválido: {npz_path}"
         self.npz_path = npz_path
         self.ego_frame = ego_frame
+
+        self.use_map = bool(use_map)
+        self.map_root = map_root
+        self.map_radius = float(map_radius)
+        self.map_max_segments = int(map_max_segments)
+        self.prefilter_margin = float(prefilter_margin)
 
         data = np.load(npz_path, allow_pickle=False)
         self.ego = data["ego"].astype(np.float32)             # (N, obs, 6)
@@ -59,34 +84,38 @@ class DrivingData(Dataset):
         assert self.neighbors.ndim == 4 and self.neighbors.shape[-1] == 7, f"neighbors debe ser (N,K,obs,7), got {self.neighbors.shape}"
         assert self.gt.ndim == 4, f"gt_future_states debe ser (N,K+1,pred,F), got {self.gt.shape}"
 
+        # --- mapa: cargar scene_id y precomputar segmentos por escena SOLO si use_map ---
+        self.scene_id = None
+        self._segments_by_scene: Optional[Dict[int, np.ndarray]] = None
+        if self.use_map:
+            if "scene_id" not in data.files:
+                raise ValueError("use_map=True requiere que el npz tenga 'scene_id'. Reprocesa para incluirlo.")
+            self.scene_id = data["scene_id"].astype(np.int64)
+            assert self.scene_id.shape[0] == self.ego.shape[0]
+
+            # cache de segmentos por escena (una sola vez)
+            polys_by_scene = load_obstacles_polylines(self.map_root)  # {sid: [poly...]}
+            self._segments_by_scene = {int(sid): polylines_to_segments(polys)
+                                       for sid, polys in polys_by_scene.items()}
+
     def __len__(self) -> int:
         return self.ego.shape[0]
 
     @staticmethod
     def _rot2d(xy: np.ndarray, c: float, s: float) -> Tuple[np.ndarray, np.ndarray]:
-        """Rota componentes (x,y) con cos/sin ya calculados."""
         xr = xy[..., 0] * c - xy[..., 1] * s
         yr = xy[..., 0] * s + xy[..., 1] * c
         return xr, yr
 
-    def _ego_transform(self, ego: np.ndarray, neighbors: np.ndarray, gt: np.ndarray):
-        """
-        ego:       (obs,6)
-        neighbors: (K,obs,7) flag en idx -1
-        gt:        (K+1,pred,F)
-        """
-        # Origen: última observación del ego
-        ego_pos0 = ego[-1, 0:2].copy()
-
-        # Heading por velocidad en el último frame observado
-        vx_end, vy_end = float(ego[-1, 2]), float(ego[-1, 3])
-        speed = float(np.hypot(vx_end, vy_end))
-        heading = 0.0 if speed < 1e-4 else float(np.arctan2(vy_end, vx_end))
+    def _ego_transform(self, ego: np.ndarray, neighbors: np.ndarray, gt: np.ndarray,
+                    ego_center_world: np.ndarray, heading: float):
+        # ego_center_world: (2,) en WORLD, heading en rad (WORLD)
+        ego_pos0 = ego_center_world.astype(np.float32).copy()
 
         c = float(np.cos(-heading))
         s = float(np.sin(-heading))
 
-        # ===== 1) Ego: trasladar + rotar pos/vel/acc =====
+        # ===== 1) Ego =====
         ego[:, 0:2] = ego[:, 0:2] - ego_pos0
         xr, yr = self._rot2d(ego[:, 0:2], c, s)
         ego[:, 0], ego[:, 1] = xr, yr
@@ -97,7 +126,7 @@ class DrivingData(Dataset):
         xr, yr = self._rot2d(ego[:, 4:6], c, s)
         ego[:, 4], ego[:, 5] = xr, yr
 
-        # ===== 2) Neighbors: solo si flag==1 (tomamos flag del último obs frame) =====
+        # ===== 2) Neighbors =====
         flag_idx = -1
         for k in range(neighbors.shape[0]):
             if neighbors[k, -1, flag_idx] <= 0.0:
@@ -113,9 +142,9 @@ class DrivingData(Dataset):
             xr, yr = self._rot2d(neighbors[k, :, 4:6], c, s)
             neighbors[k, :, 4], neighbors[k, :, 5] = xr, yr
 
-        # ===== 3) GT: rotar pos/vel/acc si existen (y si no es todo ceros) =====
+        # ===== 3) GT =====
         Fdim = gt.shape[-1]
-        for a in range(gt.shape[0]):  # (K+1)
+        for a in range(gt.shape[0]):
             if np.abs(gt[a]).sum() <= 1e-6:
                 continue
 
@@ -141,15 +170,44 @@ class DrivingData(Dataset):
         if np.all(ego == 0):
             raise ValueError(f"Sample {idx} tiene ego vacío (todo ceros). Revisa tu preprocessing.")
 
+        # --- mapa local (calculado en WORLD frame, y devuelve ya en ego-frame) ---
+        # --- pose del ego en WORLD: siempre se necesita para ego_frame ---
+        ego_xy_hist_world = ego[:, 0:2].astype(np.float32)
+        ego_center = ego_xy_hist_world[-1].copy()
+        heading = estimate_heading_from_ego_history(ego_xy_hist_world)
+
+        # --- mapa local opcional ---
+        if self.use_map:
+            sid = int(self.scene_id[idx])
+            segs_world = self._segments_by_scene[sid]  # (S,4)
+
+            map_segments, map_mask = extract_local_segments(
+                segs_world=segs_world,
+                ego_center_xy=ego_center,
+                heading=heading,
+                radius=self.map_radius,
+                max_segments=self.map_max_segments,
+                prefilter_margin=self.prefilter_margin,
+            )
+        else:
+            map_segments, map_mask = None, None
+
+        # --- tu transform actual para ego/neigh/gt ---
         if self.ego_frame:
-            ego, neighbors, gt = self._ego_transform(ego, neighbors, gt)
+             ego, neighbors, gt = self._ego_transform(ego, neighbors, gt, ego_center, heading)
 
-        return (
-            torch.from_numpy(ego).float(),
-            torch.from_numpy(neighbors).float(),
-            torch.from_numpy(gt).float(),
-        )
+        ego_t = torch.from_numpy(ego).float()
+        neigh_t = torch.from_numpy(neighbors).float()
+        gt_t = torch.from_numpy(gt).float()
 
+        if not self.use_map:
+            return ego_t, neigh_t, gt_t
+
+        map_segs_t = torch.from_numpy(map_segments).float()
+        map_mask_t = torch.from_numpy(map_mask.astype(np.bool_))
+        ego_center_t = torch.from_numpy(ego_center.astype(np.float32))          # (2,)
+        heading_t = torch.tensor([heading], dtype=torch.float32)                # (1,)
+        return ego_t, neigh_t, gt_t, map_segs_t, map_mask_t, ego_center_t, heading_t
 
 # =========================================================
 # Helpers for weights/masks (robusto)
