@@ -7,6 +7,7 @@ from torch.utils.data import Dataset
 from torch.nn import functional as F
 from typing import Tuple, Optional
 from utils.map_util import *
+from typing import Union
 
 # =========================================================
 # Logging + Reproducibility
@@ -18,7 +19,7 @@ def initLogging(log_file: str, level: str = "INFO"):
         level=getattr(logging, level, None),
         format="[%(levelname)s %(asctime)s] %(message)s",
         datefmt="%m-%d %H:%M:%S",
-    )
+        )
     logging.getLogger().addHandler(logging.StreamHandler())
 
 
@@ -34,7 +35,32 @@ def set_seed(CUR_SEED: int):
 # Dataset
 # =========================================================
 
-ETH_UCY_DATASETS = ["eth-hotel", "eth-univ", "ucy-zara01", "ucy-zara02", "ucy-univ"]
+ETH_UCY_DATASETS = [
+    "eth-hotel",
+    "eth-univ",
+    "ucy-zara01",
+    "ucy-zara02",
+    "ucy-univ",
+]
+
+THOR_MAGNI_DATASETS = [
+    "THOR_MAGNI_120522_SC3",
+    "THOR_MAGNI_130522_SC3",
+    "THOR_MAGNI_170522_SC3",
+    "THOR_MAGNI_180522_SC3",
+]
+
+
+def get_scene_names(dataset: str):
+    dataset = dataset.lower()
+
+    if dataset in ["eth_ucy", "ethucy", "eth-ucy"]:
+        return ETH_UCY_DATASETS
+
+    if dataset in ["thor", "thor_magni", "thor-magni"]:
+        return THOR_MAGNI_DATASETS
+
+    raise ValueError(f"Dataset no soportado: {dataset}")
 
 class DrivingData(Dataset):
     """
@@ -64,6 +90,7 @@ class DrivingData(Dataset):
         map_radius: float = 7.0,
         map_max_segments: int = 128,
         prefilter_margin: float = 1.0,
+        dataset: str = "eth_ucy",
     ):
         assert npz_path.endswith(".npz") and os.path.isfile(npz_path), f"Archivo inválido: {npz_path}"
         self.npz_path = npz_path
@@ -74,6 +101,8 @@ class DrivingData(Dataset):
         self.map_radius = float(map_radius)
         self.map_max_segments = int(map_max_segments)
         self.prefilter_margin = float(prefilter_margin)
+        self.dataset = dataset
+        self.scene_names = get_scene_names(dataset)
 
         data = np.load(npz_path, allow_pickle=False)
         self.ego = data["ego"].astype(np.float32)             # (N, obs, 6)
@@ -90,13 +119,23 @@ class DrivingData(Dataset):
         if self.use_map:
             if "scene_id" not in data.files:
                 raise ValueError("use_map=True requiere que el npz tenga 'scene_id'. Reprocesa para incluirlo.")
+
             self.scene_id = data["scene_id"].astype(np.int64)
             assert self.scene_id.shape[0] == self.ego.shape[0]
 
-            # cache de segmentos por escena (una sola vez)
-            polys_by_scene = load_obstacles_polylines(self.map_root)  # {sid: [poly...]}
-            self._segments_by_scene = {int(sid): polylines_to_segments(polys)
-                                       for sid, polys in polys_by_scene.items()}
+            polys_by_scene = load_obstacles_polylines(
+                self.map_root,
+                dataset=self.dataset
+            )
+
+            self._segments_by_scene = {
+                int(sid): polylines_to_segments(polys)
+                for sid, polys in polys_by_scene.items()
+            }
+
+            print(f"[DrivingData] dataset={self.dataset}")
+            print(f"[DrivingData] scene_names={self.scene_names}")
+            print(f"[DrivingData] loaded map scene ids={sorted(self._segments_by_scene.keys())}")
 
     def __len__(self) -> int:
         return self.ego.shape[0]
@@ -179,7 +218,16 @@ class DrivingData(Dataset):
         # --- mapa local opcional ---
         if self.use_map:
             sid = int(self.scene_id[idx])
-            segs_world = self._segments_by_scene[sid]  # (S,4)
+
+            if sid not in self._segments_by_scene:
+                raise KeyError(
+                    f"No hay mapa cargado para scene_id={sid}. "
+                    f"Dataset={self.dataset}. "
+                    f"Mapas cargados={sorted(self._segments_by_scene.keys())}. "
+                    f"scene_names={self.scene_names}"
+                )
+
+            segs_world = self._segments_by_scene[sid]
 
             map_segments, map_mask = extract_local_segments(
                 segs_world=segs_world,
@@ -208,6 +256,42 @@ class DrivingData(Dataset):
         ego_center_t = torch.from_numpy(ego_center.astype(np.float32))          # (2,)
         heading_t = torch.tensor([heading], dtype=torch.float32)                # (1,)
         return ego_t, neigh_t, gt_t, map_segs_t, map_mask_t, ego_center_t, heading_t
+    
+def get_current_cost_weights(predictor):
+    """
+    Lee los pesos actuales de la función de costo.
+    Funciona para Predictor normal y PredictorVAE.
+    """
+    with torch.no_grad():
+        if hasattr(predictor, "plan_net"):
+            decoder = predictor.plan_net
+        elif hasattr(predictor, "ego_decoder"):
+            decoder = predictor.ego_decoder
+        else:
+            return {}
+
+        raw_weights = decoder.cost_mlp(decoder.dummy_input)
+        weights = F.softplus(raw_weights) + 1e-3
+        weights = weights.squeeze(0).detach().cpu().numpy()
+
+        names = [
+            "acc",
+            "jerk",
+            "steer",
+            "steer_change",
+            "collision",
+            "speed_limit",
+            "endpoint_goal",
+        ]
+
+        weights_norm = weights / (weights.sum() + 1e-8)
+
+        logs = {}
+        for i, name in enumerate(names):
+            logs[f"cost_weights/{name}"] = float(weights[i])
+            logs[f"cost_weights_norm/{name}"] = float(weights_norm[i])
+
+        return logs
 
 # =========================================================
 # Helpers for weights/masks (robusto)
@@ -441,148 +525,6 @@ def motion_metrics(plan_trajectory, prediction_trajectories, ground_truth_trajec
 
     return plannerADE.item(), plannerFDE.item(), predictorADE.item(), predictorFDE.item()
 
-
-# =========================================================
-# Frame projections
-# =========================================================
-# def project_to_frenet_frame(traj, ref_line):
-#     distance_to_ref = torch.cdist(traj[:, :, :2], ref_line[:, :, :2])
-#     k = torch.argmin(distance_to_ref, dim=-1).view(-1, traj.shape[1], 1).expand(-1, -1, 3)
-#     ref_points = torch.gather(ref_line, 1, k)
-#     x_r, y_r, theta_r = ref_points[:, :, 0], ref_points[:, :, 1], ref_points[:, :, 2]
-#     x, y = traj[:, :, 0], traj[:, :, 1]
-#     s = 0.1 * (k[:, :, 0] - 200)
-#     l = torch.sign((y - y_r) * torch.cos(theta_r) - (x - x_r) * torch.sin(theta_r)) * torch.sqrt(
-#         torch.square(x - x_r) + torch.square(y - y_r)
-#     )
-#     sl = torch.stack([s, l], dim=-1)
-#     return sl
-
-
-# def project_to_cartesian_frame(traj, ref_line):
-#     k = (10 * traj[:, :, 0] + 200).long()
-#     k = torch.clip(k, 0, 1200 - 1)
-#     ref_points = torch.gather(ref_line, 1, k.view(-1, traj.shape[1], 1).expand(-1, -1, 3))
-#     x_r, y_r, theta_r = ref_points[:, :, 0], ref_points[:, :, 1], ref_points[:, :, 2]
-#     x = x_r - traj[:, :, 1] * torch.sin(theta_r)
-#     y = y_r + traj[:, :, 1] * torch.cos(theta_r)
-#     xy = torch.stack([x, y], dim=-1)
-#     return xy
-
-
-# =========================================================
-# Motion models
-# =========================================================
-# def bicycle_model(control, current_state):
-#     """
-#     Modelo cinemático de vehículo (bicycle model).
-#     current_state: (B, 6) = [x, y, vx, vy, ax, ay]  ← formato ego del dataset
-#                    (B, 4) = [x, y, theta, v]          ← formato compacto (fallback)
-#     control:       (B, T, 2) = [accel, steering]
-#     """
-#     dt = 0.4  # 0.4s por frame
-#     max_delta = 0.6
-#     max_a = 5.0
-#     L = 3.089  # wheelbase (robot/vehículo)
-
-#     x_0     = current_state[:, 0]
-#     y_0     = current_state[:, 1] 
-
-#     if current_state.shape[1] >= 6:
-#         # Formato ego del dataset: [x, y, vx, vy, ax, ay]
-#         # En el frame ego-centrado: vx > 0, vy ≈ 0, theta ≈ 0
-#         vx_0    = current_state[:, 2]
-#         vy_0    = current_state[:, 3]
-#         theta_0 = torch.atan2(vy_0, vx_0)                          # (B,) heading inicial
-#         v_0     = torch.hypot(vx_0, vy_0)                          # (B,) velocidad inicial
-#     else:
-#         # Formato compacto: [x, y, theta, v]
-#         theta_0 = current_state[:, 2]
-#         v_0     = current_state[:, 3]
-
-#     a     = control[:, :, 0].clamp(-max_a, max_a)                  # (B, T)
-#     delta = control[:, :, 1].clamp(-max_delta, max_delta)          # (B, T)
-
-#     v = torch.clamp(v_0.unsqueeze(1) + torch.cumsum(a * dt, dim=1), min=0.0)  # (B, T)
-
-#     d_theta = v * delta / L                                         # (B, T)
-#     theta   = torch.fmod(theta_0.unsqueeze(1) + torch.cumsum(d_theta * dt, dim=1), 2 * torch.pi)  # (B, T)
-
-#     x = x_0.unsqueeze(1) + torch.cumsum(v * torch.cos(theta) * dt, dim=1)  # (B, T)
-#     y = y_0.unsqueeze(1) + torch.cumsum(v * torch.sin(theta) * dt, dim=1)  # (B, T)
-
-#     return torch.stack([x, y, theta, v], dim=-1)  # (B, T, 4)
-
-# def bicycle_model(control, current_state):
-#     """
-#     Modelo cinemático bicycle.
-
-#     current_state:
-#         (B, 6) = [x, y, vx, vy, ax, ay]
-#         o
-#         (B, 4) = [x, y, theta, v]
-
-#     control:
-#         (B, T, 2) = [accel, steering]
-#     """
-#     dt = 0.4
-#     max_delta = 0.6
-#     max_a = 5.0
-#     L = 3.089
-
-#     x_0 = current_state[:, 0]
-#     y_0 = current_state[:, 1]
-
-#     if current_state.shape[1] >= 6:
-#         vx_0 = current_state[:, 2]
-#         vy_0 = current_state[:, 3]
-#         theta_0 = torch.atan2(vy_0, vx_0)
-#         v_0 = torch.hypot(vx_0, vy_0)
-#     else:
-#         theta_0 = current_state[:, 2]
-#         v_0 = current_state[:, 3]
-
-#     a = control[:, :, 0].clamp(-max_a, max_a)
-#     delta = control[:, :, 1].clamp(-max_delta, max_delta)
-
-#     B, T, _ = control.shape
-
-#     x_list = []
-#     y_list = []
-#     theta_list = []
-#     v_list = []
-
-#     x_t = x_0
-#     y_t = y_0
-#     theta_t = theta_0
-#     v_t = v_0
-
-#     for t in range(T):
-#         a_t = a[:, t]
-#         delta_t = delta[:, t]
-
-#         v_t = torch.clamp(v_t + a_t * dt, min=0.0)
-#         theta_t = theta_t + (v_t / L) * torch.tan(delta_t) * dt
-
-#         x_t = x_t + v_t * torch.cos(theta_t) * dt
-#         y_t = y_t + v_t * torch.sin(theta_t) * dt
-
-#         x_list.append(x_t)
-#         y_list.append(y_t)
-#         theta_list.append(theta_t)
-#         v_list.append(v_t)
-
-#     x = torch.stack(x_list, dim=1)
-#     y = torch.stack(y_list, dim=1)
-#     theta = torch.stack(theta_list, dim=1)
-#     v = torch.stack(v_list, dim=1)
-
-#     return torch.stack([x, y, theta, v], dim=-1)  # (B, T, 4)
-
-
-import torch
-from typing import Union
-
 def bicycle_model(control: torch.Tensor,
                   current_state: torch.Tensor,
                   dt: Union[torch.Tensor, float] = 0.4,
@@ -628,28 +570,3 @@ def bicycle_model(control: torch.Tensor,
 
     return torch.stack([x, y, theta, v], dim=-1)
 
-# def physical_model(control, current_state, dt=0.1):
-#     """
-#     Modelo físico simple (vehículo).
-#     FIX: respeta el dt que se pasa como argumento.
-#     """
-#     max_d_theta = 0.5
-#     max_a = 5
-
-#     x_0 = current_state[:, 0]
-#     y_0 = current_state[:, 1]
-#     theta_0 = current_state[:, 2]
-#     v_0 = torch.hypot(current_state[:, 3], current_state[:, 4])
-
-#     a = control[:, :, 0].clamp(-max_a, max_a)
-#     d_theta = control[:, :, 1].clamp(-max_d_theta, max_d_theta)
-
-#     v = torch.clamp(v_0.unsqueeze(1) + torch.cumsum(a * dt, dim=1), min=0.0)
-
-#     theta = torch.fmod(theta_0.unsqueeze(1) + torch.cumsum(d_theta * dt, dim=1), 2 * torch.pi)
-
-#     x = x_0.unsqueeze(1) + torch.cumsum(v * torch.cos(theta) * dt, dim=1)
-#     y = y_0.unsqueeze(1) + torch.cumsum(v * torch.sin(theta) * dt, dim=1)
-
-#     traj = torch.stack([x, y, theta, v], dim=-1)
-#     return traj

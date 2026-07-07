@@ -9,7 +9,12 @@ This repo is a fork of the original repo based in the following paper:
 And it is adapted from the context of autonomous vehicles to that of a mobile robot among pedestrians.
 
 ## 1. Dataset
-Download dataset ETH-UCY (for funcionality testing). We use this dataset because there is no specialized one.
+Download both dataset; ETH-UCY and THOR-Magni (Scenario 3)
+
+LINK TO DRIVE. (We share a link to drive with the maps and dates already preprocessed).
+
+However, if you want to preprocess the data yourself, use 3.1 
+
 
 ## 2. Installation
 ### 2.1 Install dependency
@@ -27,7 +32,17 @@ conda activate DIPP
 Install the [Theseus library](https://github.com/facebookresearch/theseus), follow the guidelines.
 
 ## 3. Usage
-Integrated planning and prediction with DIPP
+We have implemented two models:
+
+The first one: We used a determinisitc and multimodal architecture like the one used in the original DIPP.
+
+The second one: A generative model that handles uncertainty better. 
+
+Both implementations support training with different combinations for ablation studies. You can configure the flags according to your needs; by default, we use maps and the planning module.
+
+You can download the pre-processed data and maps here. (skip section 3.1)
+
+https://drive.google.com/drive/folders/179UR5_MXVMquEWQ-zCiE4911lrSoFGrB?usp=drive_link
 
 ### 3.1 Data Processing
 Process the data in joint scenes without considering the robot, you can configure the flags

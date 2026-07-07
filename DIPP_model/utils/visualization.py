@@ -5,8 +5,31 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 
 
-# Orden consistente con tu preprocessing
-ETH_UCY_DATASETS = ["eth-hotel", "eth-univ", "ucy-zara01", "ucy-zara02", "ucy-univ"]
+ETH_UCY_DATASETS = [
+    "eth-hotel",
+    "eth-univ",
+    "ucy-zara01",
+    "ucy-zara02",
+    "ucy-univ",
+]
+
+THOR_MAGNI_DATASETS = [
+    "THOR_MAGNI_120522_SC3",
+    "THOR_MAGNI_130522_SC3",
+    "THOR_MAGNI_170522_SC3",
+    "THOR_MAGNI_180522_SC3",
+]
+
+def get_scene_names(dataset):
+    dataset = dataset.lower()
+
+    if dataset in ["eth_ucy", "ethucy", "eth-ucy"]:
+        return ETH_UCY_DATASETS
+
+    if dataset in ["thor", "thor_magni", "thor-magni"]:
+        return THOR_MAGNI_DATASETS
+
+    raise ValueError(f"Dataset no soportado: {dataset}")
 
 
 def _ensure_dir(path: str):
@@ -16,20 +39,26 @@ def _ensure_dir(path: str):
 # =========================================================
 # Obstacles + circle + segments overlays (opcional)
 # =========================================================
-def _load_obstacles_polys(map_root: str, scene_id: int):
+def _load_obstacles_polys(map_root: str, scene_id: int, dataset: str = "eth_ucy"):
     """
-    Carga obstáculos como lista de polilíneas (Ni,2) desde:
+    Carga obstáculos como lista de polilíneas desde:
+        map_root/<scene_name>/obstacles.txt
     """
     if map_root is None:
         return []
     if scene_id is None:
         return []
-    if scene_id < 0 or scene_id >= len(ETH_UCY_DATASETS):
+
+    scene_names = get_scene_names(dataset)
+
+    if scene_id < 0 or scene_id >= len(scene_names):
         return []
 
-    scene_name = ETH_UCY_DATASETS[int(scene_id)]
+    scene_name = scene_names[int(scene_id)]
     path = os.path.join(map_root, scene_name, "obstacles.txt")
+
     if not os.path.exists(path):
+        print(f"[WARN visualization] No existe mapa: {path}")
         return []
 
     polys = []
@@ -47,15 +76,18 @@ def _load_obstacles_polys(map_root: str, scene_id: int):
             if s == "":
                 flush()
                 continue
+
             parts = s.replace(",", " ").split()
             if len(parts) < 2:
                 flush()
                 continue
+
             try:
                 x, y = float(parts[0]), float(parts[1])
             except ValueError:
                 flush()
                 continue
+
             cur.append([x, y])
 
     flush()
@@ -295,7 +327,7 @@ def _draw_segments_heatmap(
         cbar = plt.colorbar(sm, ax=ax, fraction=0.035, pad=0.02)
         cbar.set_label("Importancia del segmento", fontsize=9)
 
-def _maybe_draw_map_overlays(ax, sample: dict, map_root=None, map_radius=7.0):
+def _maybe_draw_map_overlays(ax, sample: dict, map_root=None, map_radius=7.0, dataset="eth_ucy"):
     """
     Dibuja overlays del mapa si existen:
       - obstáculos globales desde obstacles.txt
@@ -303,18 +335,16 @@ def _maybe_draw_map_overlays(ax, sample: dict, map_root=None, map_radius=7.0):
       - segmentos del mapa con heatmap de atención si existe attn_ego
     """
 
-    # Obstáculos en world-frame
     scene_id = sample.get("scene_id", None)
+
     if map_root is not None and scene_id is not None:
-        polys = _load_obstacles_polys(map_root, int(scene_id))
+        polys = _load_obstacles_polys(map_root, int(scene_id), dataset=dataset)
         _draw_obstacles(ax, polys)
 
-    # Círculo de radio alrededor del ego
     ego_center = sample.get("ego_center", None)
     if ego_center is not None:
         _draw_radius_circle(ax, ego_center, radius=map_radius)
 
-    # Segmentos + heatmap
     if "map_segments" in sample and "map_mask" in sample:
         _draw_segments_heatmap(
             ax=ax,
@@ -343,6 +373,7 @@ def plot_ego_topk_modes(
     sample_meta=None,
     map_root=None,
     map_radius=7.0,
+    dataset="eth_ucy",
 ):
     """
     Predictor normal:
@@ -361,7 +392,7 @@ def plot_ego_topk_modes(
 
         # Overlays (si hay)
         if sample_meta is not None:
-            _maybe_draw_map_overlays(ax, sample_meta, map_root=map_root, map_radius=map_radius)
+            _maybe_draw_map_overlays(ax, sample_meta, map_root=map_root, map_radius=map_radius, dataset=dataset)
 
         # Neighbors
         if neighbors_hist is not None:
@@ -416,7 +447,7 @@ def plot_ego_topk_modes(
 # =========================================================
 # VAE: final
 # =========================================================
-def plot_vae_final_scenario(sample, save_path=None, sample_id=0, map_root=None, map_radius=7.0):
+def plot_vae_final_scenario(sample, save_path=None, sample_id=0, map_root=None, map_radius=7.0, dataset="eth_ucy"):
     """
     Dibuja una escena VAE final:
       - ego hist/gt/pred
@@ -434,7 +465,7 @@ def plot_vae_final_scenario(sample, save_path=None, sample_id=0, map_root=None, 
     fig, ax = plt.subplots(1, 1, figsize=(7.0, 7.0), dpi=150)
 
     # overlays
-    _maybe_draw_map_overlays(ax, sample, map_root=map_root, map_radius=map_radius)
+    _maybe_draw_map_overlays(ax, sample, map_root=map_root, map_radius=map_radius, dataset=dataset)
 
     # neighbors
     for n in range(nb_hist.shape[0]):
@@ -475,7 +506,7 @@ def plot_vae_final_scenario(sample, save_path=None, sample_id=0, map_root=None, 
 # =========================================================
 # VAE: multi
 # =========================================================
-def plot_vae_multisample_scenarios(sample, save_path=None, sample_id=0, map_root=None, map_radius=7.0):
+def plot_vae_multisample_scenarios(sample, save_path=None, sample_id=0, map_root=None, map_radius=7.0, dataset="eth_ucy"):
     """
     Dibuja K muestras del VAE:
       - ego hist/gt
@@ -500,7 +531,7 @@ def plot_vae_multisample_scenarios(sample, save_path=None, sample_id=0, map_root
     fig, ax = plt.subplots(1, 1, figsize=(7.0, 7.0), dpi=150)
 
     # overlays
-    _maybe_draw_map_overlays(ax, sample, map_root=map_root, map_radius=map_radius)
+    _maybe_draw_map_overlays(ax, sample, map_root=map_root, map_radius=map_radius, dataset=dataset)
 
     # neighbors hist/gt
     for n in range(nb_hist.shape[0]):
@@ -577,6 +608,7 @@ def save_visualizations_from_samples(
     predictor_type="standard",
     map_root=None,
     map_radius=7.0,
+    dataset="eth_ucy",
 ):
     """
     samples_data: list of dicts.
@@ -608,6 +640,7 @@ def save_visualizations_from_samples(
                 sample_meta=data,
                 map_root=map_root,
                 map_radius=map_radius,
+                dataset=dataset,
             )
 
         elif kind == "vae_final":
@@ -617,6 +650,7 @@ def save_visualizations_from_samples(
                 sample_id=i,
                 map_root=map_root,
                 map_radius=map_radius,
+                dataset=dataset,
             )
 
         elif kind == "vae_multi":
@@ -626,6 +660,7 @@ def save_visualizations_from_samples(
                 sample_id=i,
                 map_root=map_root,
                 map_radius=map_radius,
+                dataset=dataset,
             )
 
         else:

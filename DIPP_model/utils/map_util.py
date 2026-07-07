@@ -4,46 +4,67 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 
 ETH_UCY_DATASETS = ["eth-hotel", "eth-univ", "ucy-zara01", "ucy-zara02", "ucy-univ"]
+THOR_MAGNI_DATASETS = [
+    "THOR_MAGNI_120522_SC3",
+    "THOR_MAGNI_130522_SC3",
+    "THOR_MAGNI_170522_SC3",
+    "THOR_MAGNI_180522_SC3",
+]
 
+def load_obstacles_polylines(map_root: str, dataset: str = "eth_ucy") -> Dict[int, List[np.ndarray]]:
+    """
+    Lee mapa/<scene>/obstacles.txt y regresa polilíneas por scene_id.
+    """
 
-def load_obstacles_polylines(map_root: str) -> Dict[int, List[np.ndarray]]:
-    """
-    Lee mapa/<scene>/obstacles.txt y regresa polilíneas por escena_id.
-    Cada obstáculo = polyline (Ni,2).
-    (Mismo formato que tu vis.py, separado por línea vacía).
-    """
+    if dataset.lower() in ["eth_ucy", "ethucy", "eth-ucy"]:
+        scene_names = ETH_UCY_DATASETS
+    elif dataset.lower() in ["thor", "thor_magni", "thor-magni"]:
+        scene_names = THOR_MAGNI_DATASETS
+    else:
+        raise ValueError(f"Dataset no soportado: {dataset}")
+
     scene_polys: Dict[int, List[np.ndarray]] = {}
 
     def load_one(path: str) -> List[np.ndarray]:
         if not os.path.exists(path):
+            print(f"[WARN] No existe mapa: {path}")
             return []
+
         polys = []
         cur = []
+
         def flush():
             nonlocal cur
             if len(cur) >= 3:
                 polys.append(np.asarray(cur, dtype=np.float32))
             cur = []
+
         with open(path, "r") as f:
             for raw in f:
                 s = raw.strip()
+
                 if s == "":
                     flush()
                     continue
+
                 parts = s.replace(",", " ").split()
+
                 if len(parts) < 2:
                     flush()
                     continue
+
                 try:
                     x, y = float(parts[0]), float(parts[1])
                 except ValueError:
                     flush()
                     continue
+
                 cur.append([x, y])
+
         flush()
         return polys
 
-    for sid, name in enumerate(ETH_UCY_DATASETS):
+    for sid, name in enumerate(scene_names):
         path = os.path.join(map_root, name, "obstacles.txt")
         scene_polys[sid] = load_one(path)
 

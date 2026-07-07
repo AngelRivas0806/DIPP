@@ -8,6 +8,23 @@ from matplotlib.patches import Circle
 
 ETH_UCY_DATASETS = ["eth-hotel", "eth-univ", "ucy-zara01", "ucy-zara02", "ucy-univ"]
 
+THOR_MAGNI_DATASETS = [
+    "THOR_MAGNI_120522_SC3",
+    "THOR_MAGNI_130522_SC3",
+    "THOR_MAGNI_170522_SC3",
+    "THOR_MAGNI_180522_SC3",
+]
+
+def get_scene_names(dataset: str):
+    dataset = dataset.lower()
+
+    if dataset in ["eth_ucy", "ethucy", "eth-ucy"]:
+        return ETH_UCY_DATASETS
+
+    if dataset in ["thor", "thor_magni", "thor-magni"]:
+        return THOR_MAGNI_DATASETS
+
+    raise ValueError(f"Dataset no soportado: {dataset}")
 
 def print_npz_info(path: str):
     data = np.load(path, allow_pickle=False)
@@ -78,9 +95,12 @@ def load_obstacles_file(path: str) -> List[np.ndarray]:
     return obstacles
 
 
-def build_obstacle_cache(map_root: str) -> Dict[int, Dict[str, Any]]:
+def build_obstacle_cache(map_root: str, dataset: str = "eth_ucy") -> Dict[int, Dict[str, Any]]:
     cache: Dict[int, Dict[str, Any]] = {}
-    for sid, scene_name in enumerate(ETH_UCY_DATASETS):
+
+    scene_names = get_scene_names(dataset)
+
+    for sid, scene_name in enumerate(scene_names):
         path = os.path.join(map_root, scene_name, "obstacles.txt")
         obs_list = load_obstacles_file(path)
         sizes = [o.shape[0] for o in obs_list]
@@ -93,8 +113,16 @@ def build_obstacle_cache(map_root: str) -> Dict[int, Dict[str, Any]]:
         else:
             bbox = None
 
-        cache[sid] = {"obstacles": obs_list, "bbox": bbox}
-        print(f"[obstacles] Scene {sid} ({scene_name}): obstacles={len(obs_list)} sizes={sizes} bbox={bbox}")
+        cache[sid] = {
+            "scene_name": scene_name,
+            "obstacles": obs_list,
+            "bbox": bbox,
+        }
+
+        print(
+            f"[obstacles] Scene {sid} ({scene_name}): "
+            f"obstacles={len(obs_list)} sizes={sizes} bbox={bbox}"
+        )
 
     return cache
 
@@ -106,6 +134,7 @@ def draw_obstacles(ax, obstacles_list: List[np.ndarray], origin, R, ego_frame: b
 
     for poly in obstacles_list:
         pts = np.asarray(poly, dtype=np.float32)
+        
         if ego_frame:
             pts = to_ego_frame(pts, origin, R)
 
@@ -135,6 +164,7 @@ def plot_sample(
     fig_h: float = 24.0,
     dpi: int = 160,
     save_path: Optional[str] = None,
+    scene_names: Optional[List[str]] = None,
 ):
     ego       = data["ego"][i]
     neighbors = data["neighbors"][i]
@@ -240,7 +270,10 @@ def plot_sample(
 
     if "scene_id" in data:
         sid = int(data["scene_id"][i])
-        scene_name = ETH_UCY_DATASETS[sid] if 0 <= sid < len(ETH_UCY_DATASETS) else f"scene_id={sid}"
+        if scene_names is not None and 0 <= sid < len(scene_names):
+             scene_name = scene_names[sid]
+        else:
+             scene_name = f"scene_id={sid}"
         ax.text(0.01, 0.99, f"scene: {scene_name} (id={sid})",
                 transform=ax.transAxes, va="top", ha="left",
                 fontsize=12, bbox=dict(facecolor="white", alpha=0.75, edgecolor="none"))
@@ -259,7 +292,71 @@ def plot_sample(
         plt.show()
         plt.close()
 
+def print_pedestrian_histogram(data, scene_names=None):
+    """
+    Imprime histograma del número de peatones/vecinos válidos por muestra.
+    Usa neighbors[..., 6] como bandera de presencia.
+    """
+    if "neighbors" not in data:
+        print("[ERROR] El .npz no tiene key 'neighbors'.")
+        return
 
+    neighbors = data["neighbors"]  # (N, K, obs_len, 7)
+
+    if neighbors.ndim != 4 or neighbors.shape[-1] < 7:
+        print(f"[ERROR] neighbors tiene forma inesperada: {neighbors.shape}")
+        return
+
+    # Vecino válido si aparece al menos una vez en la ventana observada
+    valid_neighbors = neighbors[:, :, :, 6].sum(axis=2) > 0  # (N, K)
+    num_peds = valid_neighbors.sum(axis=1).astype(np.int64)  # (N,)
+
+    values, counts = np.unique(num_peds, return_counts=True)
+
+    print("\n==============================")
+    print("Histograma global de peatones")
+    print("==============================")
+    print(f"Total muestras: {len(num_peds)}")
+    print(f"Min peatones:   {num_peds.min()}")
+    print(f"Max peatones:   {num_peds.max()}")
+    print(f"Promedio:       {num_peds.mean():.3f}")
+    print()
+
+    for v, c in zip(values, counts):
+        pct = 100.0 * c / len(num_peds)
+        print(f"{int(v):2d} peatones: {int(c):7d} muestras ({pct:6.2f}%)")
+
+    if "scene_id" not in data:
+        return
+
+    scene_ids = data["scene_id"].astype(np.int64)
+    scenes_present = np.unique(scene_ids)
+
+    print("\n================================")
+    print("Histograma de peatones por escena")
+    print("================================")
+
+    for sid in scenes_present:
+        idxs = np.where(scene_ids == sid)[0]
+        nums = num_peds[idxs]
+
+        vals, cnts = np.unique(nums, return_counts=True)
+
+        if scene_names is not None and 0 <= int(sid) < len(scene_names):
+            scene_name = scene_names[int(sid)]
+        else:
+            scene_name = f"scene_id={int(sid)}"
+
+        print(f"\n--- {scene_name} | id={int(sid)} ---")
+        print(f"Muestras:  {len(nums)}")
+        print(f"Min:       {nums.min()}")
+        print(f"Max:       {nums.max()}")
+        print(f"Promedio:  {nums.mean():.3f}")
+        print("Histograma:")
+
+        for v, c in zip(vals, cnts):
+            pct = 100.0 * c / len(nums)
+            print(f"  {int(v):2d} peatones: {int(c):7d} muestras ({pct:6.2f}%)")
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--npz", required=True)
@@ -268,7 +365,18 @@ def main():
     ap.add_argument("--out_dir", type=str, default="vis_out", help="Carpeta destino")
     ap.add_argument("--per_scene", type=int, default=None,
                     help="Cuántas por escena. Si no lo pones, se reparte automáticamente.")
-
+    ap.add_argument(
+    "--dataset",
+    type=str,
+    default="eth_ucy",
+    choices=["eth_ucy", "thor_magni"],
+    help="Dataset para cargar nombres de escenas y mapas."
+)
+    ap.add_argument(
+        "--print_ped_hist",
+        action="store_true",
+        help="Imprime histograma del número de peatones por muestra y termina."
+    )
     ap.add_argument("--ego_frame", action="store_true")
     ap.add_argument("--rotate", action="store_true")
 
@@ -282,16 +390,27 @@ def main():
 
     args = ap.parse_args()
 
+    scene_names = get_scene_names(args.dataset)
+    print("Scene names:")
+    for sid, name in enumerate(scene_names):
+        print(f"  {sid}: {name}")
+
     data = print_npz_info(args.npz)
     if "ego" not in data or data["ego"].shape[0] == 0:
         print("No samples in this file.")
+        return
+    if args.print_ped_hist:
+        print_pedestrian_histogram(data, scene_names=scene_names)
         return
 
     obstacle_cache = None
     if args.show_obstacles:
         if args.map_root is None:
             raise ValueError("Si usas --show_obstacles, debes pasar --map_root")
-        obstacle_cache = build_obstacle_cache(args.map_root)
+        obstacle_cache = build_obstacle_cache(
+            args.map_root,
+            dataset=args.dataset
+        )
 
     N = data["ego"].shape[0]
     rng = np.random.default_rng(args.seed)
@@ -317,7 +436,13 @@ def main():
             chosen = rng.choice(idxs, size=take, replace=False)
 
             for idx in chosen:
-                scene_name = ETH_UCY_DATASETS[int(sid)]
+                sid_int = int(sid)
+
+                if 0 <= sid_int < len(scene_names):
+                    scene_name = scene_names[sid_int]
+                else:
+                    scene_name = f"scene_id_{sid_int}"
+
                 out_path = os.path.join(args.out_dir, f"{scene_name}_idx{int(idx):06d}.png")
                 plot_sample(
                     data, int(idx),
@@ -328,7 +453,8 @@ def main():
                     obstacle_cache=obstacle_cache,
                     view_all_obstacles=args.view_all_obstacles,
                     fig_w=args.fig_w, fig_h=args.fig_h, dpi=args.dpi,
-                    save_path=out_path
+                    save_path=out_path,
+                    scene_names=scene_names,
                 )
                 saved += 1
                 if saved >= args.num_save:

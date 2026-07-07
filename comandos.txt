@@ -1,0 +1,17 @@
+python DIPP_model/train.py   --name DIPP_P_   --train_set DIPP_model/data/train/data.npz   --valid_set DIPP_model/data/val/data.npz   --device cuda   --batch_size 32   --train_epochs 15 --predictor Predictor  --use_planning
+python DIPP_model/test_eth_ucy.py   --model_path DIPP_model/training_log/DIPP_P_/model_15_0.4477.pth   --test_set DIPP_model/data/test/data.npz   --name DIPP_P_   --predictor Predictor    --save_vis   --save_attn --use_planning
+
+python DIPP_model/train.py   --name DIPP_NP_   --train_set DIPP_model/data/train/data.npz   --valid_set DIPP_model/data/val/data.npz   --device cuda   --batch_size 32   --train_epochs 15 --predictor Predictor 
+python DIPP_model/test_eth_ucy.py   --model_path DIPP_model/training_log/DIPP_NP_/model_15_0.4424.pth   --test_set DIPP_model/data/test/data.npz   --name DIPP_NP_   --predictor Predictor    --save_vis   --save_attn 
+
+python DIPP_model/train.py   --name VAE_NP_NM_L   --train_set DIPP_model/data/train/data.npz   --valid_set DIPP_model/data/val/data.npz   --device cuda   --batch_size 32   --train_epochs 15 --predictor PredictorVAE  --use_prior
+python DIPP_model/test_eth_ucy.py   --model_path DIPP_model/training_log/VAE_NP_NM_L/model_15_0.3292.pth   --test_set DIPP_model/data/test/data.npz   --name VAE_NP_NM_L   --predictor PredictorVAE     --save_vis --vae_prior learned 
+
+python DIPP_model/train.py   --name VAE_P_NM_L   --train_set DIPP_model/data/train/data.npz   --valid_set DIPP_model/data/val/data.npz   --device cuda   --batch_size 32   --train_epochs 15 --predictor PredictorVAE  --use_prior --use_planning
+python DIPP_model/test_eth_ucy.py   --model_path DIPP_model/training_log/VAE_P_NM_L/model_15_0.3737.pth   --test_set DIPP_model/data/test/data.npz   --name VAE_P_NM_L   --predictor PredictorVAE     --save_vis --vae_prior learned  --use_planning
+
+python DIPP_model/train.py   --name VAE_P_NM   --train_set DIPP_model/data/train/data.npz   --valid_set DIPP_model/data/val/data.npz   --device cuda   --batch_size 32   --train_epochs 15 --predictor PredictorVAE   --use_planning
+python DIPP_model/test_eth_ucy.py   --model_path DIPP_model/training_log/VAE_P_NM/model_15_0.3752.pth   --test_set DIPP_model/data/test/data.npz   --name VAE_P_NM   --predictor PredictorVAE     --save_vis --vae_prior fixed  --use_planning
+
+python DIPP_model/train.py   --name VAE_NP_NM   --train_set DIPP_model/data/train/data.npz   --valid_set DIPP_model/data/val/data.npz   --device cuda   --batch_size 32   --train_epochs 15 --predictor PredictorVAE
+python DIPP_model/test_eth_ucy.py   --model_path DIPP_model/training_log/VAE_NP_NM/model_15_0.3134.pth   --test_set DIPP_model/data/test/data.npz   --name VAE_NP_NM   --predictor PredictorVAE     --save_vis --vae_prior fixed 

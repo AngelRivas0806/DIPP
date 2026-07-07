@@ -175,7 +175,7 @@ class AgentDecoder(nn.Module):
 
 
 class PlanDecoder(nn.Module):
-    def __init__(self, future_steps, token_dims, num_modes=NUM_MODES, num_cost_weights=6):
+    def __init__(self, future_steps, token_dims, num_modes=NUM_MODES, num_cost_weights=7):
         super(PlanDecoder, self).__init__()
         self._future_steps = future_steps
         self._num_modes    = num_modes
@@ -242,7 +242,7 @@ class Predictor(nn.Module):
         self.embed_dim      = embed_dim
         self.pedestrian_net = AgentEncoder(embed_dim=self.embed_dim)    # Encoding the history of each agent: ego and neighbors (embed_dim)
         self.agent_agent_net= Agent2Agent(modes=num_modes, tokens_dim=embed_dim) # Inter agent attention module
-        self.plan_net       = PlanDecoder(future_steps=self._future_steps, token_dims=embed_dim, num_modes=num_modes) # Plan decoder
+        self.plan_net       = PlanDecoder(future_steps=self._future_steps, token_dims=embed_dim, num_modes=num_modes, num_cost_weights=7) # Plan decoder
         if self.use_map:
             self.map_encoder = MapEncoder(embed_dim=self.embed_dim)  # espera 8 dims
             self.agent_map_net = Agent2Map(modes=num_modes, tokens_dim=embed_dim)

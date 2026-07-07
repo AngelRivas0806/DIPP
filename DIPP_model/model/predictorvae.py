@@ -73,7 +73,7 @@ class DecoderVAE(nn.Module):
         return trajs
     
 class EgoDecoderVAE(nn.Module):
-    def __init__(self, future_steps, token_dims, num_cost_weights=6):
+    def __init__(self, future_steps, token_dims, num_cost_weights=7):
         super(EgoDecoderVAE, self).__init__()
         self._future_steps = future_steps
 
@@ -96,7 +96,7 @@ class EgoDecoderVAE(nn.Module):
             nn.Linear(64, num_cost_weights)
         )
 
-        # Dummy input fijo (no es parámetro, solo valor constante de relleno)
+        # Dummy input fijo (no es parámetro, solo valor constante)
         self.register_buffer('dummy_input', torch.ones(1, 1, dtype=torch.float32))
 
     def forward(self, x):
@@ -303,7 +303,7 @@ class PredictorVAE(nn.Module):
 
             agent_agent = agent_agent + agent_map
 
-            agent_agent_gap = GAP(agent_agent)   # (B, 1, 256)
+        agent_agent_gap = GAP(agent_agent)   # (B, 1, 256)
 
         # =====================================================
         #  prior (fixed or learned)

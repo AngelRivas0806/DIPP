@@ -101,36 +101,41 @@ def collision_avoidance_residual(optim_vars, aux_vars):
     # escala suave (opcional)
     return 0.1 * collision
 
-def trajectory_following_residual(optim_vars, aux_vars):
+def endpoint_goal_residual(optim_vars, aux_vars):
     """
+    Costo de acercamiento al último punto del GT del ego.
+
     aux_vars:
-      0: gt_trajectory (B, T, 2)  [x, y]
-      1: current_state (B, 1+K, 8)
+      0: gt_trajectory (B, T, D)   contiene al menos [x, y]
+      1: current_state (B, 1+K, 6/8)
+      2: dt
+
     returns:
-      (B, 2 * ceil(T/2))  (x errors + y errors sampled)
+      (B, 2)  error final en x,y
     """
+
     u = optim_vars[0].tensor
     control, T = _reshape_control(u)
 
-    gt_trajectory = aux_vars[0].tensor       # (B, T, 3)
-    current_state = aux_vars[1].tensor       # (B, 1+K, 8)
+    gt_trajectory = aux_vars[0].tensor       # (B, T, D)
+    current_state = aux_vars[1].tensor       # (B, 1+K, state_dim)
     dt = aux_vars[2].tensor[0]
 
-    ego_current_state = current_state[:, 0]  # (B, 8)
-    ego_traj = bicycle_model(control, ego_current_state)  # (B, T, 4)
-    pos_pred = ego_traj[:, :, :2]            # (B, T, 2)
-    pos_gt = gt_trajectory[:, :, :2]         # (B, T, 2)
+    ego_current_state = current_state[:, 0]  # (B, state_dim)
 
-    # muestreo cada 2 steps (0,2,4,...)
-    pos_pred_s = pos_pred[:, ::2, :]         # (B, ceil(T/2), 2)
-    pos_gt_s = pos_gt[:, ::2, :]             # (B, ceil(T/2), 2)
+    # Simulamos trayectoria del ego con los controles optimizados
+    ego_traj = bicycle_model(control, ego_current_state, dt=dt)  # (B, T, 4)
 
-    err = pos_pred_s - pos_gt_s              # (B, ceil(T/2), 2)
-    err_x = err[:, :, 0]                     # (B, ceil(T/2))
-    err_y = err[:, :, 1]                     # (B, ceil(T/2))
+    # Última posición planeada
+    pred_final_pos = ego_traj[:, -1, :2]      # (B, 2)
 
-    traj_err = torch.cat([err_x, err_y], dim=1)  # (B, 2*ceil(T/2))
-    return 0.1 * traj_err
+    # Última posición del ground truth del ego
+    gt_final_pos = gt_trajectory[:, -1, :2]   # (B, 2)
+
+    # Residuo: diferencia final en x,y
+    endpoint_error = pred_final_pos - gt_final_pos  # (B, 2)
+
+    return 0.1 * endpoint_error
 
 
 # =========================
@@ -141,13 +146,14 @@ def build_objective(
     control_variables: th.Vector, # Variable de optimizacion (control), lo que Theseus ajusta
     current_state: th.Variable, # th.variable son variables auxiliares no optimizables
     predictions: th.Variable,
+    gt_trajectory: th.Variable,
     weights: dict,
     trajectory_len: int,
     dt_var: th.Variable,
     safety_distance_var: th.Variable,
     max_speed_var: th.Variable,
     vectorize: bool = True,
-):
+    ):
     T = trajectory_len
     Tm1 = max(T - 1, 1)
 
@@ -156,15 +162,12 @@ def build_objective(
     objective.add(th.AutoDiffCostFunction([control_variables], jerk_residual, Tm1, weights["jerk"], aux_vars=[dt_var], autograd_vectorize=vectorize, name="jerk"))
     objective.add(th.AutoDiffCostFunction([control_variables], steering_residual, T, weights["steer"], autograd_vectorize=vectorize, name="steering"))
     objective.add(th.AutoDiffCostFunction([control_variables], steering_change_residual, Tm1, weights["steer_change"], aux_vars=[dt_var], autograd_vectorize=vectorize, name="steering_change"))
-    # Safety
-        # Speed limit
     objective.add(th.AutoDiffCostFunction([control_variables], speed_limit_residual, T, weights["speed_limit"], aux_vars=[current_state, dt_var, max_speed_var], autograd_vectorize=vectorize,
-        name="speed_limit"
-    ))
+        name="speed_limit"))
     objective.add(th.AutoDiffCostFunction([control_variables], collision_avoidance_residual, T, weights["collision"], aux_vars=[predictions, current_state, dt_var, safety_distance_var],
-        autograd_vectorize=vectorize,
-        name="collision_avoidance"
-    ))
+        autograd_vectorize=vectorize, name="collision_avoidance"))
+    objective.add(th.AutoDiffCostFunction([control_variables], endpoint_goal_residual, 2, weights["endpoint_goal"], aux_vars=[gt_trajectory, current_state, dt_var],
+            autograd_vectorize=vectorize, name="endpoint_goal"))
 
     return objective
 
@@ -180,6 +183,7 @@ class MotionPlanner:
       - steer
       - steer_change
       - collision
+      - endpoint_goal
     """
     def __init__(self, trajectory_len: int, device, test: bool = False, dt: float = 0.4, safety_distance: float = 0.5, max_speed: float = 1.5):
 
@@ -193,13 +197,14 @@ class MotionPlanner:
         self.control_variables = th.Vector(dof=trajectory_len * 2, name="control_variables")
         self.predictions = th.Variable(torch.empty(1, 10, trajectory_len, 2), name="predictions")
         self.current_state = th.Variable(torch.empty(1, 11, 6), name="current_state")
+        self.gt_trajectory = th.Variable(torch.empty(1, trajectory_len, 2, device=self.device), name="gt_trajectory")
 
         # Aux scalars as Variables
         self.dt_var = th.Variable(torch.tensor([dt]), name="dt")
         self.safety_distance_var = th.Variable(torch.tensor([safety_distance]), name="safety_distance")
         self.max_speed_var = th.Variable(torch.tensor([max_speed], dtype=torch.float32, device=self.device), name="max_speed")
 
-        # Learnable weights (5)
+        # Learnable weights (7)
         self.cost_weights_vars = {
             "acc":          th.Variable(torch.rand(1), name="w_acc"),
             "jerk":         th.Variable(torch.rand(1), name="w_jerk"),
@@ -207,6 +212,7 @@ class MotionPlanner:
             "steer_change": th.Variable(torch.rand(1), name="w_steer_change"),
             "collision":    th.Variable(torch.rand(1), name="w_collision"),
             "speed_limit":  th.Variable(torch.rand(1), name="w_speed_limit"),
+            "endpoint_goal": th.Variable(torch.rand(1), name="w_endpoint_goal"),
         }
         self.cost_weights = {k: th.ScaleCostWeight(v) for k, v in self.cost_weights_vars.items()}
 
@@ -218,6 +224,7 @@ class MotionPlanner:
             control_variables=self.control_variables,
             current_state=self.current_state,
             predictions=self.predictions,
+            gt_trajectory=self.gt_trajectory,
             weights=self.cost_weights,
             trajectory_len=trajectory_len,
             dt_var=self.dt_var,
@@ -228,23 +235,9 @@ class MotionPlanner:
 
         # Optimizer
         if test:
-            self.optimizer = th.GaussNewton(
-                objective, th.CholeskyDenseSolver,
-                vectorize=False, max_iterations=3, step_size=0.3, abs_err_tolerance=1e-2
-            )
-        # else:
-        #     self.optimizer = th.GaussNewton(
-        #         objective, th.LUDenseSolver,
-        #         vectorize=False, max_iterations=10, step_size=0.3
-        #     )
+            self.optimizer = th.GaussNewton(objective, th.CholeskyDenseSolver, vectorize=False, max_iterations=3, step_size=0.3, abs_err_tolerance=1e-2)
         else:
-            self.optimizer = th.GaussNewton(
-                objective,
-                th.CholeskyDenseSolver,
-                vectorize=False,
-                max_iterations=5,
-                step_size=0.15,
-                abs_err_tolerance=1e-3,
-         )
+            self.optimizer = th.GaussNewton(objective, th.CholeskyDenseSolver, vectorize=False, max_iterations=5, step_size=0.15, abs_err_tolerance=1e-3)
+
         self.layer = th.TheseusLayer(self.optimizer, vectorize=False)
         self.layer.to(self.device)  

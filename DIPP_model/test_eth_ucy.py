@@ -35,6 +35,76 @@ def compute_ade_fde(predictions, ground_truth):
     fde = torch.mean(displacement[:, -1])
     return ade.item(), fde.item()
 
+def compute_efficiency_metrics(
+    ego_traj,
+    control,
+    neighbor_pred,
+    safety_distance=0.5,
+    dt=0.4,
+):
+    """
+    ego_traj:      (B, T, 3) o (B, T, 4), trayectoria del ego
+    control:       (B, T, 2), [acceleration, steering]
+    neighbor_pred: (B, N, T, 2), predicciones de vecinos
+
+    Returns dict con promedios por batch.
+    """
+
+    acc = control[:, :, 0]      # (B, T)
+    steer = control[:, :, 1]    # (B, T)
+
+    jerk = torch.diff(acc, dim=1) / dt            # (B, T-1)
+    steer_change = torch.diff(steer, dim=1) / dt  # (B, T-1)
+
+    acc_metric = acc.abs().mean().item()
+    jerk_metric = jerk.abs().mean().item()
+    steer_metric = steer.abs().mean().item()
+    steer_change_metric = steer_change.abs().mean().item()
+
+    # ==========================
+    # Collision / safety violation
+    # ==========================
+    ego_pos = ego_traj[:, :, :2]              # (B, T, 2)
+    neighbors_pos = neighbor_pred[:, :, :, :2]  # (B, N, T, 2)
+
+    # vecinos válidos: si todo es cero, es padding
+    neighbor_valid_mask = (
+        neighbors_pos.abs().sum(dim=-1).sum(dim=-1) > 0.01
+    )  # (B, N)
+
+    ego_pos_exp = ego_pos.unsqueeze(1)  # (B, 1, T, 2)
+
+    distances = torch.norm(
+        ego_pos_exp - neighbors_pos,
+        dim=-1
+    )  # (B, N, T)
+
+    distances = torch.where(
+        neighbor_valid_mask.unsqueeze(-1).expand_as(distances),
+        distances,
+        torch.ones_like(distances) * 1e4
+    )
+
+    min_distances, _ = torch.min(distances, dim=1)  # (B, T)
+
+    collision_violation = torch.clamp(
+        safety_distance - min_distances,
+        min=0.0
+    )  # (B, T)
+
+    collision_metric = collision_violation.mean().item()
+
+    # También útil: porcentaje de timesteps con violación
+    collision_rate = (collision_violation > 0.0).float().mean().item()
+
+    return {
+        "acceleration": acc_metric,
+        "jerk": jerk_metric,
+        "steering": steer_metric,
+        "steering_change": steer_change_metric,
+        "collision": collision_metric,
+        "collision_rate": collision_rate,
+    }
 
 def segs_ego_to_world(segs_ego, ego_center_world, heading_rad):
     # segs_ego: (M,4) [x1,y1,x2,y2] en ego-frame
@@ -314,13 +384,20 @@ def run_batch_vae(
             prior=("learned" if vae_prior == "learned" else "fixed"),
             return_attn=want_attn,
         )
-    except TypeError:
-        # Backward compatibility: model.inference may not accept some kwargs
-        if vae_prior == "learned" and hasattr(model, "inference_learned_prior"):
-            outputs = model.inference_learned_prior(ego, neighbors, num_samples=num_samples)
-        else:
-            # Try without map + return_attn + prior
-            outputs = model.inference(ego, neighbors, num_samples=num_samples)
+    # except TypeError:
+    #     # Backward compatibility: model.inference may not accept some kwargs
+    #     if vae_prior == "learned" and hasattr(model, "inference_learned_prior"):
+    #         outputs = model.inference_learned_prior(ego, neighbors, num_samples=num_samples)
+    #     else:
+    #         # Try without map + return_attn + prior
+    #         outputs = model.inference(ego, neighbors, num_samples=num_samples)
+    except TypeError as e:
+        print("\n[ERROR] model.inference no aceptó los argumentos con mapa/atención")
+        print("return_attn:", want_attn)
+        print("map_segments is None?", map_segments is None)
+        print("map_mask is None?", map_mask is None)
+        print("TypeError:", e)
+        raise
 
     # ---- Unpack outputs ----
     z = None
@@ -588,6 +665,12 @@ def evaluate_model_standard(
 ):
     model.eval()
 
+    eff_accs = []
+    eff_jerks = []
+    eff_steers = []
+    eff_steer_changes = []
+    eff_collisions = []
+    eff_collision_rates = []
     ego_ades, ego_fdes = [], []
     neighbor_ades, neighbor_fdes = [], []
     vis_samples = []
@@ -624,19 +707,29 @@ def evaluate_model_standard(
             map_mask=map_mask,
             return_attn=save_attn,
             )
-        # Elegir modo final (sin planner): argmax de scores
+        # Elegir modo final: argmax de scores
+        batch_ids = torch.arange(ego.shape[0], device=device)
         best_mode_idx = torch.argmax(model_out["scores"], dim=1)  # (B,)
 
-        final_plan_traj = model_out["plan_trajs"][torch.arange(ego.shape[0], device=device), best_mode_idx]          # (B,T,3)
-        final_prediction = model_out["predictions_all"][torch.arange(ego.shape[0], device=device), best_mode_idx]    # (B,N,T,3)
+        # Trayectoria y predicción del modo seleccionado ANTES del planner
+        final_plan_traj = model_out["plan_trajs"][batch_ids, best_mode_idx]          # (B,T,3)
+        final_prediction = model_out["predictions_all"][batch_ids, best_mode_idx]    # (B,N,T,2)
+
+        # Control inicial del modo seleccionado
+        plan_control_init = model_out["plans"][batch_ids, best_mode_idx]             # (B,T,2)
+
+        # Por defecto, si NO hay planning, el control final es el control inicial
+        final_control = plan_control_init
+
+        # Si hay planning, Theseus refina el control
         if use_planning and planner is not None:
-            plan_control_init = model_out["plans"][torch.arange(ego.shape[0], device=device), best_mode_idx]  # (B,T,2)
 
             w = model_out["cost_function_weights"]
+
             if w.dim() == 3 and w.shape[1] == 1:
                 w = w[:, 0]
 
-            final_plan_traj, _ = apply_planning_single(
+            final_plan_traj, final_control = apply_planning_single(
                 plan_control_init=plan_control_init,
                 prediction_init=final_prediction,
                 cost_function_weights_init=w,
@@ -645,6 +738,24 @@ def evaluate_model_standard(
                 planner=planner,
                 T=12
             )
+
+        # =========================
+        # Efficiency / safety metrics
+        # =========================
+        eff = compute_efficiency_metrics(
+            ego_traj=final_plan_traj,
+            control=final_control,
+            neighbor_pred=final_prediction,
+            safety_distance=0.5,
+            dt=0.4,
+        )
+
+        eff_accs.append(eff["acceleration"])
+        eff_jerks.append(eff["jerk"])
+        eff_steers.append(eff["steering"])
+        eff_steer_changes.append(eff["steering_change"])
+        eff_collisions.append(eff["collision"])
+        eff_collision_rates.append(eff["collision_rate"])
 
         # Metrics - ego
         ego_gt = ground_truth[:, 0, :, :2]
@@ -726,6 +837,12 @@ def evaluate_model_standard(
         "ego_FDE": np.mean(ego_fdes) if ego_fdes else 0.0,
         "neighbor_ADE": np.mean(neighbor_ades) if neighbor_ades else 0.0,
         "neighbor_FDE": np.mean(neighbor_fdes) if neighbor_fdes else 0.0,
+        "acceleration": np.mean(eff_accs) if eff_accs else 0.0,
+        "jerk": np.mean(eff_jerks) if eff_jerks else 0.0,
+        "steering": np.mean(eff_steers) if eff_steers else 0.0,
+        "steering_change": np.mean(eff_steer_changes) if eff_steer_changes else 0.0,
+        "collision": np.mean(eff_collisions) if eff_collisions else 0.0,
+        "collision_rate": np.mean(eff_collision_rates) if eff_collision_rates else 0.0,
         "num_samples": len(ego_ades),
         "num_neighbors_evaluated": len(neighbor_ades),
         "vis_samples": vis_samples,
@@ -753,6 +870,12 @@ def evaluate_model_vae(
     """
     model.eval()
 
+    eff_accs = []
+    eff_jerks = []
+    eff_steers = []
+    eff_steer_changes = []
+    eff_collisions = []
+    eff_collision_rates = []
     ego_ades, ego_fdes = [], []
     neighbor_ades, neighbor_fdes = [], []
     vis_samples = []
@@ -804,7 +927,7 @@ def evaluate_model_vae(
 
         # 3) Planner: UNA sola optimización (si use_planning)
         if use_planning and planner is not None:
-            final_plan_traj, _ = apply_planning_single(
+            final_plan_traj, final_control = apply_planning_single(
                 plan_control_init=plan_control_init,
                 prediction_init=prediction_init,
                 cost_function_weights_init=weights_init,
@@ -814,10 +937,25 @@ def evaluate_model_vae(
                 T=12
             )
         else:
-            # si no hay planner, conviertes control->traj con bicycle
-            final_plan_traj = bicycle_model(plan_control_init, ego[:, -1])[:, :, :3]
+            final_control = plan_control_init
+            final_plan_traj = bicycle_model(final_control, ego[:, -1])[:, :, :3]
 
         final_prediction = prediction_init  # vecinos (seleccionados o promedio)
+
+        eff = compute_efficiency_metrics(
+            ego_traj=final_plan_traj,
+            control=final_control,
+            neighbor_pred=final_prediction,
+            safety_distance=0.5,
+            dt=0.4,
+        )
+
+        eff_accs.append(eff["acceleration"])
+        eff_jerks.append(eff["jerk"])
+        eff_steers.append(eff["steering"])
+        eff_steer_changes.append(eff["steering_change"])
+        eff_collisions.append(eff["collision"])
+        eff_collision_rates.append(eff["collision_rate"])
 
         # 4) Metrics - ego
         ego_gt = ground_truth[:, 0, :, :2]
@@ -868,21 +1006,26 @@ def evaluate_model_vae(
                     if selected_idx is not None:
                         sample_final["selected_idx"] = int(selected_idx[bb].item())
                     # ---- Adjuntar mapa local (segmentos) ----
-                    if map_segments is not None and map_mask is not None:
-# ---- Adjuntar mapa local (segmentos) en WORLD ----
-                        if map_segments is not None and map_mask is not None and raw_dataset is not None:
-                            seg_ego = map_segments[bb].detach().cpu().numpy().astype(np.float32)
+                    if (
+                        map_segments is not None
+                        and map_mask is not None
+                        and raw_dataset is not None
+                        and ego_center_batch is not None
+                        and heading_batch is not None
+                    ):
+                        seg_ego = map_segments[bb].detach().cpu().numpy().astype(np.float32)
 
-                            ego_center_world = ego_center_batch[bb].detach().cpu().numpy().astype(np.float32)
-                            heading = float(heading_batch[bb].detach().cpu().item())
+                        ego_center_world = ego_center_batch[bb].detach().cpu().numpy().astype(np.float32)
+                        heading = float(heading_batch[bb].detach().cpu().item())
 
-                            seg_world = segs_ego_to_world(seg_ego, ego_center_world, heading)
+                        seg_world = segs_ego_to_world(seg_ego, ego_center_world, heading)
 
-                            sample_final["map_segments"] = seg_world
-                            sample_final["map_mask"]     = map_mask[bb].detach().cpu().numpy()
-                        elif map_segments is not None and map_mask is not None:
-                            sample_final["map_segments"] = map_segments[bb].detach().cpu().numpy()
-                            sample_final["map_mask"]     = map_mask[bb].detach().cpu().numpy()
+                        sample_final["map_segments"] = seg_world
+                        sample_final["map_mask"] = map_mask[bb].detach().cpu().numpy()
+
+                    elif map_segments is not None and map_mask is not None:
+                        sample_final["map_segments"] = map_segments[bb].detach().cpu().numpy()
+                        sample_final["map_mask"] = map_mask[bb].detach().cpu().numpy()
                     # ---- Adjuntar atención (solo ego) ----
                     attn_w = model_out.get("attn_w", None)  # esperado: (B, modes, heads, A, M)
                     if attn_w is not None:
@@ -892,6 +1035,41 @@ def evaluate_model_vae(
                         attn_ego = aw[0]              # ego idx 0 -> (M,)
                         attn_ego = attn_ego / (attn_ego.max() + 1e-8)
                         sample_final["attn_ego"] = attn_ego.detach().cpu().numpy()
+
+                        if batch_idx == 0 and bb == 0:
+                            print("\n========== DEBUG HEATMAP ==========")
+                            print("dataset:", getattr(raw_dataset, "dataset", None))
+                            print("scene_id:", sample_final.get("scene_id", None))
+                            print("sample keys:", list(sample_final.keys()))
+
+                            print("map_segments in sample?", "map_segments" in sample_final)
+                            print("map_mask in sample?", "map_mask" in sample_final)
+
+                            if "map_segments" in sample_final:
+                                ms = np.asarray(sample_final["map_segments"])
+                                print("map_segments shape:", ms.shape)
+                                print("map_segments min/max:", float(np.nanmin(ms)), float(np.nanmax(ms)))
+
+                            if "map_mask" in sample_final:
+                                mm = np.asarray(sample_final["map_mask"]).astype(bool)
+                                print("map_mask shape:", mm.shape)
+                                print("map_mask sum:", int(mm.sum()))
+
+                            print("attn_w is None?", attn_w is None)
+
+                            if attn_w is not None:
+                                print("attn_w shape:", tuple(attn_w.shape))
+                                print("attn_w min/max:", float(attn_w.min()), float(attn_w.max()))
+
+                            print("attn_ego in sample?", "attn_ego" in sample_final)
+
+                            if "attn_ego" in sample_final:
+                                ae = np.asarray(sample_final["attn_ego"])
+                                print("attn_ego shape:", ae.shape)
+                                print("attn_ego min/max:", float(ae.min()), float(ae.max()))
+                                print("attn_ego std:", float(ae.std()))
+
+                            print("===================================\n")
 
                     vis_samples.append(sample_final)
 
@@ -941,6 +1119,12 @@ def evaluate_model_vae(
         "ego_FDE": np.mean(ego_fdes) if ego_fdes else 0.0,
         "neighbor_ADE": np.mean(neighbor_ades) if neighbor_ades else 0.0,
         "neighbor_FDE": np.mean(neighbor_fdes) if neighbor_fdes else 0.0,
+        "acceleration": np.mean(eff_accs) if eff_accs else 0.0,
+        "jerk": np.mean(eff_jerks) if eff_jerks else 0.0,
+        "steering": np.mean(eff_steers) if eff_steers else 0.0,
+        "steering_change": np.mean(eff_steer_changes) if eff_steer_changes else 0.0,
+        "collision": np.mean(eff_collisions) if eff_collisions else 0.0,
+        "collision_rate": np.mean(eff_collision_rates) if eff_collision_rates else 0.0,
         "num_samples": len(ego_ades),
         "num_neighbors_evaluated": len(neighbor_ades),
         "vis_samples": vis_samples,
@@ -975,8 +1159,16 @@ def main():
     parser.add_argument("--use_map", action="store_true", help="Usar mapa (segmentos locales)")
     parser.add_argument("--map_root", type=str, default="mapa")
     parser.add_argument("--map_radius", type=float, default=7.0)
-    parser.add_argument("--map_max_segments", type=int, default=10)
+    parser.add_argument("--map_max_segments", type=int, default=64)
     parser.add_argument("--map_prefilter_margin", type=float, default=1.0)
+
+    parser.add_argument(
+    "--dataset",
+    type=str,
+    default="eth_ucy",
+    choices=["eth_ucy", "thor_magni"],
+    help="Dataset usado para mapear scene_id a nombres de carpetas de mapa."
+    )
 
     # Interpretation
     parser.add_argument("--save_attn", action="store_true", help="Guardar/usar pesos de atención agente->segmento (solo ego) para visualización.")
@@ -1050,6 +1242,7 @@ def main():
     map_radius=args.map_radius,
     map_max_segments=args.map_max_segments,
     prefilter_margin=args.map_prefilter_margin,
+    dataset=args.dataset,
     )
     test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
     logging.info(f"Test set: {len(test_set)} samples")
@@ -1102,6 +1295,13 @@ def main():
     logging.info(f"  Total samples: {results['num_samples']}")
     logging.info(f"  Neighbors evaluated: {results['num_neighbors_evaluated']}")
     logging.info("=" * 60)
+    logging.info("Efficiency / Comfort / Safety:")
+    logging.info(f"  Acceleration:     {results['acceleration']:.4f}")
+    logging.info(f"  Jerk:             {results['jerk']:.4f}")
+    logging.info(f"  Steering:         {results['steering']:.4f}")
+    logging.info(f"  Steering Change:  {results['steering_change']:.4f}")
+    logging.info(f"  Collision:        {results['collision']:.4f}")
+    logging.info(f"  Collision Rate:   {results['collision_rate']:.4f}")
 
     results_file = f"{log_path}/results.txt"
     with open(results_file, "w") as f:
@@ -1109,6 +1309,9 @@ def main():
         f.write(f"Test set: {args.test_set}\n")
         f.write(f"Use planning: {args.use_planning}\n")
         f.write(f"Predictor: {args.predictor}\n")
+        f.write(f"Dataset: {args.dataset}\n")
+        f.write(f"Use map: {args.use_map}\n")
+        f.write(f"Map root: {args.map_root}\n")
         if args.predictor == "PredictorVAE":
             f.write(f"VAE prior: {args.vae_prior}\n")
             f.write(f"VAE num samples: {args.vae_num_samples}\n")
@@ -1121,6 +1324,13 @@ def main():
         f.write(f"Neighbor FDE: {results['neighbor_FDE']:.4f} m\n")
         f.write(f"Total samples: {results['num_samples']}\n")
         f.write(f"Neighbors evaluated: {results['num_neighbors_evaluated']}\n")
+        f.write("\n")
+        f.write(f"Acceleration: {results['acceleration']:.4f}\n")
+        f.write(f"Jerk: {results['jerk']:.4f}\n")
+        f.write(f"Steering: {results['steering']:.4f}\n")
+        f.write(f"Steering Change: {results['steering_change']:.4f}\n")
+        f.write(f"Collision: {results['collision']:.4f}\n")
+        f.write(f"Collision Rate: {results['collision_rate']:.4f}\n")
 
     logging.info(f"Results saved to: {results_file}")
 
@@ -1133,6 +1343,7 @@ def main():
             predictor_type=results["predictor_type"],
             map_root=args.map_root,
             map_radius=args.map_radius,
+            dataset=args.dataset,
 )
         logging.info(f"Visualizations saved to: {vis_path}")
 
